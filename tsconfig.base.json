@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    // CommonJS output so the emitted dist/ is loadable by `node
+    // dist/.../main.js` with no extra runtime tooling. ESM (NodeNext)
+    // would work too but requires every relative import in the source
+    // to carry an explicit `.js` extension — switching that across the
+    // codebase is invasive without practical benefit while every prod
+    // process is plain `node`. If we move to a bundler (esbuild) or
+    // hosting that prefers ESM, revisit this.
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+    // No `paths` aliases at the base level. Workspace packages have
+    // their own `dist/` builds with `main: "dist/index.js"` + `types:
+    // "dist/index.d.ts"` — tsc resolves them via `node_modules` ↦
+    // pnpm/yarn workspace symlink ↦ each package's own dist.
+    //
+    // Why no paths: with paths, tsc treated workspace source as part
+    // of every importing app's compilation, ballooning each app's
+    // dist with re-compiled copies of every dep and nesting outputs
+    // under `dist/apps/<name>/src/`. Without paths the dist is flat
+    // (`dist/main.js`) and each workspace pkg ships its own dist
+    // exactly once.
+    //
+    // Fresh checkout requires `yarn build` (or `yarn turbo build`)
+    // once before typecheck works, because the .d.ts files only
+    // exist after each workspace pkg compiles. Turbo's
+    // `dependsOn: ["^build"]` handles the order automatically.
+  }
+}

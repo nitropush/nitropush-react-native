@@ -1,0 +1,58 @@
+# Dependencies
+node_modules
+.pnp.*
+
+# Yarn Berry
+.yarn/cache
+.yarn/install-state.gz
+.yarn/build-state.yml
+.yarn/unplugged
+
+# Build output
+dist
+build
+out
+coverage
+*.tgz
+
+# TypeScript incremental
+*.tsbuildinfo
+
+# Turborepo
+.turbo
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Caches
+.eslintcache
+.cache
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+
+# Native build output
+ios/Pods
+ios/build
+**/Pods
+android/.gradle
+android/build
+android/app/build
+android/.cxx
+
+# Expo
+.expo
