@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/release-it/schema/release-it.json",
+  "git": {
+    "commitMessage": "🔧 chore(react-native): release v${version}",
+    "tagName": "react-native-v${version}",
+    "tagAnnotation": "@nitropush/react-native v${version}",
+    "requireBranch": "main",
+    "requireCleanWorkingDir": true,
+    "requireUpstream": false
+  },
+  "npm": {
+    "publish": true,
+    "skipChecks": true,
+    "tag": "beta"
+  },
+  "github": {
+    "release": true,
+    "preRelease": true,
+    "autoGenerate": true,
+    "releaseName": "@nitropush/react-native v${version}"
+  }
+}
