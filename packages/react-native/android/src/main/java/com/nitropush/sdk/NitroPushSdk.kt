@@ -88,9 +88,9 @@ class NitroPushSdk private constructor(
         /**
          * Build an [NlConfig] by reading `NITROPUSH_*` keys from the app's
          * `<application>` `<meta-data>` tags in `AndroidManifest.xml`. Mirror
-         * of iOS's `configFromInfoPlist()`. Throws if any required key is
-         * absent so misconfiguration surfaces at the no-arg `configure()`
-         * call site rather than at the first network request.
+         * of iOS's `configFromInfoPlist()`. Only `NITROPUSH_DEPLOYMENT_KEY` is
+         * required — server and storage URLs fall back to the NitroPush-hosted
+         * endpoints when absent.
          */
         @JvmStatic
         fun configFromManifest(): NlConfig {
@@ -100,13 +100,13 @@ class NitroPushSdk private constructor(
                 PackageManager.GET_META_DATA,
             )
             val meta = ai.metaData
-                ?: error("AndroidManifest.xml is missing NITROPUSH_* <meta-data>")
-            fun req(key: String): String =
-                meta.getString(key) ?: error("missing $key in AndroidManifest meta-data")
+                ?: error("AndroidManifest.xml is missing NITROPUSH_DEPLOYMENT_KEY <meta-data>")
+            val deploymentKey = meta.getString("NITROPUSH_DEPLOYMENT_KEY")
+                ?: error("missing NITROPUSH_DEPLOYMENT_KEY in AndroidManifest meta-data")
             return NlConfig(
-                serverUrl = req("NITROPUSH_SERVER_URL"),
-                deploymentKey = req("NITROPUSH_DEPLOYMENT_KEY"),
-                storageBaseUrl = req("NITROPUSH_STORAGE_BASE_URL"),
+                serverUrl = meta.getString("NITROPUSH_SERVER_URL") ?: "https://api.nitropush.org",
+                deploymentKey = deploymentKey,
+                storageBaseUrl = meta.getString("NITROPUSH_STORAGE_BASE_URL") ?: "https://cdn.nitropush.org",
                 appVersion = meta.getString("NITROPUSH_APP_VERSION"),
                 clientUniqueId = meta.getString("NITROPUSH_CLIENT_UNIQUE_ID"),
             )

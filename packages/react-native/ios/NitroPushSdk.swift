@@ -805,13 +805,16 @@ extension NitroPushSdk {
     }
 
     /// Read an `NPConfig` from `Info.plist` keys. Used by the no-arg
-    /// `NitroPush.configure()` JS factory. Required keys throw on absence:
-    ///   • `NITROPUSH_SERVER_URL`
-    ///   • `NITROPUSH_DEPLOYMENT_KEY`
-    ///   • `NITROPUSH_STORAGE_BASE_URL`
-    /// Optional:
-    ///   • `NITROPUSH_APP_VERSION`
-    ///   • `NITROPUSH_CLIENT_UNIQUE_ID`
+    /// `NitroPush.configure()` JS factory. Only `NITROPUSH_DEPLOYMENT_KEY` is
+    /// required — `serverUrl` and `storageBaseUrl` default to the NitroPush-
+    /// hosted endpoints when absent from Info.plist.
+    ///   Required:
+    ///     • `NITROPUSH_DEPLOYMENT_KEY`
+    ///   Optional (override hosted defaults):
+    ///     • `NITROPUSH_SERVER_URL`        (default: https://api.nitropush.org)
+    ///     • `NITROPUSH_STORAGE_BASE_URL`  (default: https://cdn.nitropush.org)
+    ///     • `NITROPUSH_APP_VERSION`
+    ///     • `NITROPUSH_CLIENT_UNIQUE_ID`
     public static func configFromInfoPlist() throws -> NPConfig {
         func read(_ key: String) -> String? {
             guard let raw = Bundle.main.object(forInfoDictionaryKey: key) as? String else {
@@ -820,25 +823,15 @@ extension NitroPushSdk {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
-        guard let serverUrl = read("NITROPUSH_SERVER_URL") else {
-            throw NitroPushError.invalidConfig(
-                "Info.plist is missing NITROPUSH_SERVER_URL — pass an explicit config to configureWith() instead"
-            )
-        }
         guard let deploymentKey = read("NITROPUSH_DEPLOYMENT_KEY") else {
             throw NitroPushError.invalidConfig(
-                "Info.plist is missing NITROPUSH_DEPLOYMENT_KEY — pass an explicit config to configureWith() instead"
-            )
-        }
-        guard let storageBaseUrl = read("NITROPUSH_STORAGE_BASE_URL") else {
-            throw NitroPushError.invalidConfig(
-                "Info.plist is missing NITROPUSH_STORAGE_BASE_URL — pass an explicit config to configureWith() instead"
+                "Info.plist is missing NITROPUSH_DEPLOYMENT_KEY"
             )
         }
         return NPConfig(
-            serverUrl: serverUrl,
+            serverUrl: read("NITROPUSH_SERVER_URL") ?? "https://api.nitropush.org",
             deploymentKey: deploymentKey,
-            storageBaseUrl: storageBaseUrl,
+            storageBaseUrl: read("NITROPUSH_STORAGE_BASE_URL") ?? "https://cdn.nitropush.org",
             appVersion: read("NITROPUSH_APP_VERSION"),
             clientUniqueId: read("NITROPUSH_CLIENT_UNIQUE_ID")
         )

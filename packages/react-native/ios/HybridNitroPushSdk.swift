@@ -5,10 +5,12 @@
 //  Singleton factory exposed as the JS `NitroPush` HybridObject. Two
 //  factories build a `HybridNitroPushClient`:
 //
-//    • `configure()`     — reads NITROPUSH_* keys from Info.plist on iOS
-//                          (AndroidManifest meta-data on Android) and
-//                          applies them to the underlying core.
-//    • `configureWith()` — applies an explicit `NitroPushConfig`.
+//    • `configure()`     — reads NITROPUSH_DEPLOYMENT_KEY from Info.plist
+//                          (AndroidManifest meta-data on Android); server
+//                          and CDN URLs default to the NitroPush-hosted
+//                          endpoints (api.nitropush.org / cdn.nitropush.org).
+//    • `configureWith()` — applies a fully explicit `NitroPushConfig`
+//                          (custom server / CDN).
 //
 //  Both share the process-wide `NitroPushSdk.shared` core; the returned
 //  client is a thin wrapper that delegates every call to it.

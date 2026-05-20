@@ -13,9 +13,6 @@ import {
   type SyncStatusChangedCallback,
 } from "./types";
 
-const NITROPUSH_SERVER_URL = "https://api.nitropush.org";
-const NITROPUSH_STORAGE_BASE_URL = "https://cdn.nitropush.org";
-
 let _factory: NitroPush | undefined;
 
 function factory(): NitroPush {
@@ -27,21 +24,18 @@ function factory(): NitroPush {
 
 /**
  * Build a `NitroPushClient` targeting the NitroPush-hosted service.
- * Internally wires `serverUrl` → `https://api.nitropush.org` and
- * `storageBaseUrl` → `https://cdn.nitropush.org`. Only the `deploymentKey`
- * is required from the caller.
+ * `serverUrl` and `storageBaseUrl` are hardcoded in native code
+ * (Swift/Kotlin) — only the deployment key is required, read from
+ * Info.plist (`NITROPUSH_DEPLOYMENT_KEY`) on iOS or AndroidManifest
+ * meta-data on Android.
  *
  * @example
  * ```ts
- * const client = configure('PROD-XXXXXX');
+ * const client = configure();
  * ```
  */
-export function configure(deploymentKey: string): NitroPushClient {
-  return factory().configureWith({
-    serverUrl: NITROPUSH_SERVER_URL,
-    deploymentKey,
-    storageBaseUrl: NITROPUSH_STORAGE_BASE_URL,
-  });
+export function configure(): NitroPushClient {
+  return factory().configure();
 }
 
 /**
