@@ -13,6 +13,9 @@ import {
   type SyncStatusChangedCallback,
 } from "./types";
 
+const NITROPUSH_SERVER_URL = "https://api.nitropush.org";
+const NITROPUSH_STORAGE_BASE_URL = "https://cdn.nitropush.org";
+
 let _factory: NitroPush | undefined;
 
 function factory(): NitroPush {
@@ -23,27 +26,34 @@ function factory(): NitroPush {
 }
 
 /**
- * Build a `NitroPushClient` from native defaults — `NITROPUSH_SERVER_URL`,
- * `NITROPUSH_DEPLOYMENT_KEY`, and `NITROPUSH_STORAGE_BASE_URL` keys in
- * Info.plist (iOS) or AndroidManifest meta-data (Android).
+ * Build a `NitroPushClient` targeting the NitroPush-hosted service.
+ * Internally wires `serverUrl` → `https://api.nitropush.org` and
+ * `storageBaseUrl` → `https://cdn.nitropush.org`. Only the `deploymentKey`
+ * is required from the caller.
  *
- * Throws if any required key is missing. Use `configureWith()` for
- * environment-driven config.
+ * @example
+ * ```ts
+ * const client = configure('PROD-XXXXXX');
+ * ```
  */
-export function configure(): NitroPushClient {
-  return factory().configure();
+export function configure(deploymentKey: string): NitroPushClient {
+  return factory().configureWith({
+    serverUrl: NITROPUSH_SERVER_URL,
+    deploymentKey,
+    storageBaseUrl: NITROPUSH_STORAGE_BASE_URL,
+  });
 }
 
 /**
- * Build a `NitroPushClient` with explicit configuration. Replaces any
- * previously-applied config on the underlying singleton.
+ * Build a `NitroPushClient` with fully explicit configuration.
+ * Use this when targeting a self-hosted server or a custom CDN.
  *
  * @example
  * ```ts
  * const client = configureWith({
- *   serverUrl: process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL!,
- *   deploymentKey: process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY!,
- *   storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL!,
+ *   serverUrl: 'https://my-server.example.com',
+ *   deploymentKey: 'MY-KEY',
+ *   storageBaseUrl: 'https://my-cdn.example.com/bundles',
  * });
  * ```
  */
