@@ -14,6 +14,13 @@ data class NlConfig(
     val storageBaseUrl: String,
     val appVersion: String? = null,
     val clientUniqueId: String? = null,
+    /**
+     * Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
+     * signature verification. When set, every downloaded bundle *must*
+     * carry a valid signature in its manifest entry — unsigned or
+     * tampered bundles are rejected. `null` (default) skips verification.
+     */
+    val bundlePublicKey: String? = null,
 )
 
 data class NlRemotePackage(

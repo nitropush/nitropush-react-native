@@ -78,6 +78,9 @@ public final class NitroPushSdk {
     private var storageBaseUrl: String?
     private var appVersion: String?
     private var clientUniqueId: String?
+    /// Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
+    /// signature verification. `nil` means verification is skipped.
+    private var bundlePublicKey: String?
 
     private var progressListeners: [Int: (NPDownloadProgress) -> Void] = [:]
     private var nextListenerId: Int = 1
@@ -139,6 +142,7 @@ public final class NitroPushSdk {
             : trimmedStorage
         self.appVersion = config.appVersion ?? Self.binaryAppVersion()
         self.clientUniqueId = config.clientUniqueId ?? Self.fallbackDeviceId()
+        self.bundlePublicKey = config.bundlePublicKey
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
@@ -615,6 +619,26 @@ public final class NitroPushSdk {
             dest: bundleDest
         )
 
+        if let pubKey = self.bundlePublicKey {
+            guard let sig = manifest.bundle.signature else {
+                try? FileManager.default.removeItem(at: releaseDir)
+                throw NitroPushError.integrityFailure(
+                    "bundle is unsigned but a bundlePublicKey is configured — refusing to install"
+                )
+            }
+            do {
+                try Self.verifyBundleSignature(
+                    sha256: manifest.bundle.sha256,
+                    signatureBase64: sig,
+                    publicKeyBase64: pubKey
+                )
+                log("downloadManifestRelease → signature OK", manifest.bundle.sha256)
+            } catch {
+                try? FileManager.default.removeItem(at: releaseDir)
+                throw error
+            }
+        }
+
         for (idx, asset) in manifest.assets.enumerated() {
             let dest = releaseDir.appendingPathComponent(asset.originalPath)
             try FileManager.default.createDirectory(
@@ -718,6 +742,9 @@ private struct SdkManifestBundle: Decodable {
     let originalPath: String
     let sha256: String
     let objectKey: String
+    /// Base64 DER ECDSA P-256 signature over `"bundle:<sha256>"`.
+    /// Present only when the release was created with a signing key.
+    let signature: String?
 }
 
 private struct SdkManifestAsset: Decodable {
@@ -833,7 +860,8 @@ extension NitroPushSdk {
             deploymentKey: deploymentKey,
             storageBaseUrl: read("NITROPUSH_STORAGE_BASE_URL") ?? "https://cdn.nitropush.org",
             appVersion: read("NITROPUSH_APP_VERSION"),
-            clientUniqueId: read("NITROPUSH_CLIENT_UNIQUE_ID")
+            clientUniqueId: read("NITROPUSH_CLIENT_UNIQUE_ID"),
+            bundlePublicKey: read("NITROPUSH_BUNDLE_PUBLIC_KEY")
         )
     }
 
@@ -849,6 +877,44 @@ extension NitroPushSdk {
         let v = UUID().uuidString
         UserDefaults.standard.set(v, forKey: key)
         return v
+    }
+
+    /// Verify an ECDSA P-256 bundle signature.
+    /// - Parameters:
+    ///   - sha256: Hex SHA-256 of the bundle bytes (already verified by
+    ///     `downloadToFile`).
+    ///   - signatureBase64: Base64 DER-encoded ECDSA signature produced by
+    ///     the server's `signBundleSha256` helper.
+    ///   - publicKeyBase64: Base64 DER SubjectPublicKeyInfo from `NPConfig`.
+    private static func verifyBundleSignature(
+        sha256: String,
+        signatureBase64: String,
+        publicKeyBase64: String
+    ) throws {
+        guard let pubKeyData = Data(base64Encoded: publicKeyBase64) else {
+            throw NitroPushError.integrityFailure("bundlePublicKey is not valid base64")
+        }
+        guard let sigData = Data(base64Encoded: signatureBase64) else {
+            throw NitroPushError.integrityFailure("bundle signature is not valid base64")
+        }
+        let pubKey: P256.Signing.PublicKey
+        do {
+            pubKey = try P256.Signing.PublicKey(derRepresentation: pubKeyData)
+        } catch {
+            throw NitroPushError.integrityFailure("bundlePublicKey parse failed: \(error)")
+        }
+        let sig: P256.Signing.ECDSASignature
+        do {
+            sig = try P256.Signing.ECDSASignature(derRepresentation: sigData)
+        } catch {
+            throw NitroPushError.integrityFailure("bundle signature parse failed: \(error)")
+        }
+        let message = Data("bundle:\(sha256)".utf8)
+        guard pubKey.isValidSignature(sig, for: message) else {
+            throw NitroPushError.integrityFailure(
+                "bundle signature mismatch for sha256 \(sha256)"
+            )
+        }
     }
 
     private static func sha256Hex(of file: URL) throws -> String {
