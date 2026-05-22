@@ -11,19 +11,27 @@ public struct NPConfig {
     public let storageBaseUrl: String
     public let appVersion: String?
     public let clientUniqueId: String?
+    /// Base64-encoded DER SubjectPublicKeyInfo for the ECDSA P-256 key
+    /// used to verify bundle signatures. When set, every downloaded
+    /// bundle *must* carry a valid signature in its manifest entry —
+    /// bundles with a missing or invalid signature are rejected.
+    /// When `nil` (default) signature verification is skipped.
+    public let bundlePublicKey: String?
 
     public init(
         serverUrl: String,
         deploymentKey: String,
         storageBaseUrl: String,
         appVersion: String? = nil,
-        clientUniqueId: String? = nil
+        clientUniqueId: String? = nil,
+        bundlePublicKey: String? = nil
     ) {
         self.serverUrl = serverUrl
         self.deploymentKey = deploymentKey
         self.storageBaseUrl = storageBaseUrl
         self.appVersion = appVersion
         self.clientUniqueId = clientUniqueId
+        self.bundlePublicKey = bundlePublicKey
     }
 }
 

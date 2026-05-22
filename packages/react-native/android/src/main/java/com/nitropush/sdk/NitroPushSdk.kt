@@ -14,10 +14,14 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.facebook.react.ReactApplication
 import com.facebook.react.ReactNativeHost
 import org.json.JSONObject
+import android.util.Base64
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.KeyFactory
 import java.security.MessageDigest
+import java.security.Signature
+import java.security.spec.X509EncodedKeySpec
 import java.util.UUID
 
 /**
@@ -88,9 +92,9 @@ class NitroPushSdk private constructor(
         /**
          * Build an [NlConfig] by reading `NITROPUSH_*` keys from the app's
          * `<application>` `<meta-data>` tags in `AndroidManifest.xml`. Mirror
-         * of iOS's `configFromInfoPlist()`. Throws if any required key is
-         * absent so misconfiguration surfaces at the no-arg `configure()`
-         * call site rather than at the first network request.
+         * of iOS's `configFromInfoPlist()`. Only `NITROPUSH_DEPLOYMENT_KEY` is
+         * required — server and storage URLs fall back to the NitroPush-hosted
+         * endpoints when absent.
          */
         @JvmStatic
         fun configFromManifest(): NlConfig {
@@ -100,15 +104,16 @@ class NitroPushSdk private constructor(
                 PackageManager.GET_META_DATA,
             )
             val meta = ai.metaData
-                ?: error("AndroidManifest.xml is missing NITROPUSH_* <meta-data>")
-            fun req(key: String): String =
-                meta.getString(key) ?: error("missing $key in AndroidManifest meta-data")
+                ?: error("AndroidManifest.xml is missing NITROPUSH_DEPLOYMENT_KEY <meta-data>")
+            val deploymentKey = meta.getString("NITROPUSH_DEPLOYMENT_KEY")
+                ?: error("missing NITROPUSH_DEPLOYMENT_KEY in AndroidManifest meta-data")
             return NlConfig(
-                serverUrl = req("NITROPUSH_SERVER_URL"),
-                deploymentKey = req("NITROPUSH_DEPLOYMENT_KEY"),
-                storageBaseUrl = req("NITROPUSH_STORAGE_BASE_URL"),
+                serverUrl = meta.getString("NITROPUSH_SERVER_URL") ?: "https://api.nitropush.org",
+                deploymentKey = deploymentKey,
+                storageBaseUrl = meta.getString("NITROPUSH_STORAGE_BASE_URL") ?: "https://cdn.nitropush.org",
                 appVersion = meta.getString("NITROPUSH_APP_VERSION"),
                 clientUniqueId = meta.getString("NITROPUSH_CLIENT_UNIQUE_ID"),
+                bundlePublicKey = meta.getString("NITROPUSH_BUNDLE_PUBLIC_KEY"),
             )
         }
     }
@@ -151,6 +156,9 @@ class NitroPushSdk private constructor(
     private var storageBaseUrl: String? = null
     private var appVersion: String? = null
     private var clientUniqueId: String? = null
+    /** Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
+     *  signature verification. `null` means verification is skipped. */
+    private var bundlePublicKey: String? = null
 
     private val progressListeners = mutableMapOf<Int, (NlDownloadProgress) -> Unit>()
     private var nextListenerId = 1
@@ -190,6 +198,7 @@ class NitroPushSdk private constructor(
         storageBaseUrl = storage.trimEnd('/')
         appVersion = config.appVersion ?: binaryAppVersion()
         clientUniqueId = config.clientUniqueId ?: fallbackDeviceId()
+        bundlePublicKey = config.bundlePublicKey
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
@@ -684,8 +693,23 @@ class NitroPushSdk private constructor(
         val bundleSha256 = bundleObj.getString("sha256")
         val bundleObjectKey = bundleObj.getString("objectKey")
         val bundleOriginalPath = bundleObj.getString("originalPath")
+        val bundleSignature = bundleObj.optString("signature").takeIf { it.isNotEmpty() }
         val bundleDest = File(releaseDir, bundleOriginalPath).also { it.parentFile?.mkdirs() }
         fetchByContentHash(resolveObjectUrl(bundleObjectKey), bundleSha256, bundleDest)
+
+        bundlePublicKey?.let { pubKey ->
+            if (bundleSignature == null) {
+                releaseDir.deleteRecursively()
+                error("bundle is unsigned but a bundlePublicKey is configured — refusing to install")
+            }
+            try {
+                verifyBundleSignature(bundleSha256, bundleSignature, pubKey)
+                log("downloadManifestRelease → signature OK") { bundleSha256 }
+            } catch (e: Throwable) {
+                releaseDir.deleteRecursively()
+                throw e
+            }
+        }
 
         val assets = manifest.optJSONArray("assets") ?: org.json.JSONArray()
         val total = assets.length()
@@ -772,6 +796,46 @@ class NitroPushSdk private constructor(
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * Verify an ECDSA P-256 (SHA-256) bundle signature.
+     *
+     * @param sha256           Hex SHA-256 of the bundle bytes.
+     * @param signatureBase64  Base64 DER-encoded ECDSA signature from the manifest.
+     * @param publicKeyBase64  Base64 DER SubjectPublicKeyInfo from [NlConfig.bundlePublicKey].
+     * @throws IllegalStateException if the signature is invalid or the key/sig can't be parsed.
+     */
+    private fun verifyBundleSignature(
+        sha256: String,
+        signatureBase64: String,
+        publicKeyBase64: String,
+    ) {
+        val pubKeyBytes = try {
+            Base64.decode(publicKeyBase64, Base64.DEFAULT)
+        } catch (e: Throwable) {
+            error("bundlePublicKey is not valid base64: ${e.message}")
+        }
+        val sigBytes = try {
+            Base64.decode(signatureBase64, Base64.DEFAULT)
+        } catch (e: Throwable) {
+            error("bundle signature is not valid base64: ${e.message}")
+        }
+        val publicKey = try {
+            KeyFactory.getInstance("EC")
+                .generatePublic(X509EncodedKeySpec(pubKeyBytes))
+        } catch (e: Throwable) {
+            error("bundlePublicKey parse failed: ${e.message}")
+        }
+        val valid = try {
+            val sig = Signature.getInstance("SHA256withECDSA")
+            sig.initVerify(publicKey)
+            sig.update("bundle:$sha256".toByteArray(Charsets.UTF_8))
+            sig.verify(sigBytes)
+        } catch (e: Throwable) {
+            error("bundle signature verification error: ${e.message}")
+        }
+        check(valid) { "bundle signature mismatch for sha256 $sha256" }
     }
 
     /** GET → string. Used for the small Expo manifest fetch. */

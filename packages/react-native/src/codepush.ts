@@ -23,27 +23,31 @@ function factory(): NitroPush {
 }
 
 /**
- * Build a `NitroPushClient` from native defaults — `NITROPUSH_SERVER_URL`,
- * `NITROPUSH_DEPLOYMENT_KEY`, and `NITROPUSH_STORAGE_BASE_URL` keys in
- * Info.plist (iOS) or AndroidManifest meta-data (Android).
+ * Build a `NitroPushClient` targeting the NitroPush-hosted service.
+ * `serverUrl` and `storageBaseUrl` are hardcoded in native code
+ * (Swift/Kotlin) — only the deployment key is required, read from
+ * Info.plist (`NITROPUSH_DEPLOYMENT_KEY`) on iOS or AndroidManifest
+ * meta-data on Android.
  *
- * Throws if any required key is missing. Use `configureWith()` for
- * environment-driven config.
+ * @example
+ * ```ts
+ * const client = configure();
+ * ```
  */
 export function configure(): NitroPushClient {
   return factory().configure();
 }
 
 /**
- * Build a `NitroPushClient` with explicit configuration. Replaces any
- * previously-applied config on the underlying singleton.
+ * Build a `NitroPushClient` with fully explicit configuration.
+ * Use this when targeting a self-hosted server or a custom CDN.
  *
  * @example
  * ```ts
  * const client = configureWith({
- *   serverUrl: process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL!,
- *   deploymentKey: process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY!,
- *   storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL!,
+ *   serverUrl: 'https://my-server.example.com',
+ *   deploymentKey: 'MY-KEY',
+ *   storageBaseUrl: 'https://my-cdn.example.com/bundles',
  * });
  * ```
  */
