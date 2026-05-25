@@ -477,7 +477,29 @@ class NitroPushSdk private constructor(
     fun activeBundleFile(): String? {
         val active = readActive() ?: return null
         val file = File(active.bundlePath)
-        return if (file.exists()) file.absolutePath else null
+        if (!file.exists()) return null
+        if (!isHermesBundle(file)) {
+            log("activeBundleFile → skipped") {
+                "bundle at ${file.absolutePath} is not Hermes bytecode (.hbc); " +
+                "falling back to binary bundle. Re-release with --bundle to upload a Hermes-compiled bundle."
+            }
+            return null
+        }
+        return file.absolutePath
+    }
+
+    /**
+     * Returns true when [file] begins with the 4-byte Hermes HBC magic
+     * (0xc6 0x1f 0xbc 0x03). All other formats are rejected so the SDK
+     * never loads a plain-JS bundle that would silently fail on the new arch.
+     */
+    private fun isHermesBundle(file: File): Boolean {
+        val magic = byteArrayOf(0xc6.toByte(), 0x1f, 0xbc.toByte(), 0x03)
+        return try {
+            file.inputStream().use { it.readNBytes(4).contentEquals(magic) }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun consumePendingPointerOnLaunch() {

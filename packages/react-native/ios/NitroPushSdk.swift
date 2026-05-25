@@ -413,7 +413,24 @@ public final class NitroPushSdk {
     public func activeBundleURL() -> URL? {
         guard let active = readActive() else { return nil }
         let url = URL(fileURLWithPath: active.bundlePath)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard isHermesBundle(at: url.path) else {
+            log("activeBundleURL → skipped",
+                "bundle at \(url.path) is not Hermes bytecode (.hbc); " +
+                "falling back to binary bundle. Re-release with --bundle to upload a Hermes-compiled bundle.")
+            return nil
+        }
+        return url
+    }
+
+    /// Returns `true` when the file at `path` begins with the 4-byte Hermes
+    /// HBC magic (0xc6 0x1f 0xbc 0x03). All other formats are rejected so the
+    /// SDK never loads a plain-JS bundle that would silently fail on the new arch.
+    private func isHermesBundle(at path: String) -> Bool {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
+        defer { fh.closeFile() }
+        let magic = fh.readData(ofLength: 4)
+        return magic == Data([0xc6, 0x1f, 0xbc, 0x03])
     }
 
     private func consumePendingPointerOnLaunch() {
