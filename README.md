@@ -6,7 +6,7 @@
 
 **Native-first OTA updates for React Native, built on Nitro Modules.**
 
-[Website](https://nitropush.cloud) · [Docs](https://nitropush.cloud/docs) · [npm](https://www.npmjs.com/package/@nitropush/react-native)
+[Website](https://nitropush.org) · [Docs](https://nitropush.org/docs) · [npm](https://www.npmjs.com/package/@nitropush/react-native)
 
 </div>
 
