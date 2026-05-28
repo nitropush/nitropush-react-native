@@ -67,8 +67,8 @@
       "reactCompiler": false
     },
     "extra": {
-      "nitropushServerUrl": "http://localhost:3003",
-      "nitropushDeploymentKey": "TEST-KEY-Q1IEQH"
+      "nitropushServerUrl": "https://api.nitropush.org",
+      "nitropushDeploymentKey": "nl_test_eCRLfzr07MDeCjrOc_P1MoGkpXIBUj7JyHtCCasNlK4"
     }
   }
 }
