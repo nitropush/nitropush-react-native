@@ -7,7 +7,7 @@
  *
  * What it does at `expo prebuild` time:
  *
- *   ▸ AppDelegate.swift       inject `import NitroPushNative`
+ *   ▸ AppDelegate.swift       inject `import NitroPush`
  *                             inject `configure()` + background update-check
  *                             `Task.detached` (when serverUrl + deploymentKey
  *                             are provided as plugin props)
@@ -178,7 +178,7 @@ import {
   /**
    * The Ruby snippet injected into the generated Podfile's post_install block.
    *
-   * It rewrites `Pods/Target Support Files/NitroPushNative/NitroPushNative-umbrella.h`
+   * It rewrites `Pods/Target Support Files/NitroPush/NitroPush-umbrella.h`
    * so the nitrogen-generated C++ `.hpp` `#imports` are wrapped in
    * `#ifdef __cplusplus`. Without this, Xcode 26 validates the umbrella in
    * pure ObjC mode and the `namespace margelo::nitro …` declarations fail
@@ -190,10 +190,10 @@ import {
    * @internal Exported for unit testing.
    */
   export const NITROPUSH_PODFILE_UMBRELLA_SNIPPET = [
-    "    # NitroPushNative — Xcode 26 strict-modular-headers fix.",
+    "    # NitroPush — Xcode 26 strict-modular-headers fix.",
     "    nitropush_umbrella = File.join(",
     "      installer.sandbox.root.to_s,",
-    "      'Target Support Files/NitroPushNative/NitroPushNative-umbrella.h'",
+    "      'Target Support Files/NitroPush/NitroPush-umbrella.h'",
     "    )",
     "    if File.exist?(nitropush_umbrella)",
     "      nitropush_content = File.read(nitropush_umbrella)",
@@ -257,7 +257,7 @@ import {
   
   /**
    * Patches `AppDelegate.swift` so:
-   *   1. `NitroPushNative` is imported.
+   *   1. `NitroPush` is imported.
    *   2. `configure()` + a background update-check task are injected into
    *      `application(_:didFinishLaunchingWithOptions:)` (only when
    *      serverUrl + deploymentKey are provided).
@@ -277,10 +277,10 @@ import {
   ): string {
     let src = contents;
   
-    // 1. import NitroPushNative — after the first import statement.
+    // 1. import NitroPush — after the first import statement.
     src = mergeContents({
       src,
-      newSrc: "import NitroPushNative",
+      newSrc: "import NitroPush",
       anchor: /^import .+$/m,
       offset: 1,
       tag: TAG_IOS_IMPORT,
