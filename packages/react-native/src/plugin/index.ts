@@ -172,8 +172,9 @@ import {
   }; 
   
   // ─── iOS: Podfile post_install umbrella patch ────────────────────────────────
-  
+
   const TAG_IOS_PODFILE_UMBRELLA = "nitropush-ios-podfile-umbrella-patch";
+  const TAG_IOS_PODFILE_NITROMODULES_CXX = "nitropush-ios-podfile-nitromodules-cxx";
   
   /**
    * The Ruby snippet injected into the generated Podfile's post_install block.
@@ -189,6 +190,27 @@ import {
    *
    * @internal Exported for unit testing.
    */
+  /**
+   * Ruby snippet that forces C++ mode on the NitroModules target so Xcode 26
+   * can find `<functional>`, `<type_traits>`, etc. when validating its public
+   * module headers.  Without this, strict-modular-headers validation runs the
+   * umbrella in ObjC mode and the C++ stdlib `#include`s fail with
+   * "'functional' file not found".
+   *
+   * @internal Exported for unit testing.
+   */
+  export const NITROMODULES_PODFILE_CXX_SNIPPET = [
+    "    # NitroModules — C++ stdlib headers fix for Xcode 26 strict-modular-headers.",
+    "    installer.pods_project.targets.each do |target|",
+    "      if target.name == 'NitroModules'",
+    "        target.build_configurations.each do |config|",
+    "          config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++20'",
+    "          config.build_settings['SWIFT_OBJC_INTEROP_MODE'] = 'objcxx'",
+    "        end",
+    "      end",
+    "    end",
+  ].join("\n");
+
   export const NITROPUSH_PODFILE_UMBRELLA_SNIPPET = [
     "    # NitroPush — Xcode 26 strict-modular-headers fix.",
     "    nitropush_umbrella = File.join(",
@@ -221,8 +243,8 @@ import {
     // Anchor on the Expo-specific last argument of `react_native_post_install`.
     // The next line is the call's closing `)`, so offset 2 lands AFTER the
     // call ends but still inside the surrounding `post_install do |installer|`
-    // block — exactly where we want the umbrella patch to run.
-    const expoAnchor = mergeContents({
+    // block — exactly where we want both patches to run.
+    const umbrellaExpo = mergeContents({
       src: contents,
       newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
       anchor:
@@ -231,11 +253,24 @@ import {
       tag: TAG_IOS_PODFILE_UMBRELLA,
       comment: "#",
     });
-    if (expoAnchor.didMerge || expoAnchor.didClear) return expoAnchor.contents;
-  
+    const useExpoAnchors = umbrellaExpo.didMerge || umbrellaExpo.didClear;
+    let patched = umbrellaExpo.contents;
+
+    // NitroModules C++ fix — same anchor, injected right after the umbrella block.
+    const cxxExpo = mergeContents({
+      src: patched,
+      newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
+      anchor:
+        /:ccache_enabled\s*=>\s*ccache_enabled\?\(podfile_properties\),?\s*$/m,
+      offset: 2,
+      tag: TAG_IOS_PODFILE_NITROMODULES_CXX,
+      comment: "#",
+    });
+    if (useExpoAnchors || cxxExpo.didMerge || cxxExpo.didClear) return cxxExpo.contents;
+
     // Bare RN template (no Expo ccache helper): anchor on the last common
     // argument of react_native_post_install. Offset 2 lands past the `)`.
-    const rnAnchor = mergeContents({
+    const umbrellaRn = mergeContents({
       src: contents,
       newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
       anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
@@ -243,7 +278,17 @@ import {
       tag: TAG_IOS_PODFILE_UMBRELLA,
       comment: "#",
     });
-    return rnAnchor.contents;
+    patched = umbrellaRn.contents;
+
+    const cxxRn = mergeContents({
+      src: patched,
+      newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
+      anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
+      offset: 2,
+      tag: TAG_IOS_PODFILE_NITROMODULES_CXX,
+      comment: "#",
+    });
+    return cxxRn.contents;
   }
   
   
