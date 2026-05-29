@@ -163,6 +163,9 @@ class NitroPushSdk private constructor(
     private val progressListeners = mutableMapOf<Int, (NPDownloadProgress) -> Unit>()
     private var nextListenerId = 1
 
+    /** releaseId → pre-signed manifest proxy URL from the server. */
+    private val manifestUrlOverride = mutableMapOf<String, String>()
+
     private var pendingResume: Pair<NPLocalPackage, Long>? = null
     private var pendingSuspend: NPLocalPackage? = null
     private var lastBackgroundedAt: Long = 0
@@ -634,7 +637,7 @@ class NitroPushSdk private constructor(
             val platforms = if (platformsArr != null) {
                 Array(platformsArr.length()) { platformsArr.getString(it) }
             } else null
-            return NPRemotePackage(
+            val pkg = NPRemotePackage(
                 releaseId = r.getString("releaseId"),
                 kind = r.optString("kind", "codepush"),
                 label = r.getString("label"),
@@ -649,6 +652,11 @@ class NitroPushSdk private constructor(
                 description = r.optString("description").takeIf { it.isNotEmpty() },
                 downloadObjectKey = r.getString("downloadObjectKey"),
             )
+            // Cache the pre-signed manifest proxy URL for use in downloadManifestRelease.
+            r.optString("downloadUrl").takeIf { it.isNotEmpty() }?.let {
+                manifestUrlOverride[pkg.releaseId] = it
+            }
+            return pkg
         } finally {
             conn.disconnect()
         }
@@ -691,7 +699,8 @@ class NitroPushSdk private constructor(
      * `expo` and `codepush` kinds — the manifest format is identical.
      */
     private fun downloadManifestRelease(pkg: NPRemotePackage, releaseDir: File): String {
-        val manifestUrl = resolveObjectUrl(pkg.downloadObjectKey)
+        val manifestUrl = manifestUrlOverride[pkg.releaseId]
+            ?: resolveObjectUrl(pkg.downloadObjectKey)
         log("downloadManifestRelease") { "GET $manifestUrl" }
         val manifestText = httpGetString(manifestUrl)
         val manifest = try {
@@ -717,7 +726,9 @@ class NitroPushSdk private constructor(
         val bundleOriginalPath = bundleObj.getString("originalPath")
         val bundleSignature = bundleObj.optString("signature").takeIf { it.isNotEmpty() }
         val bundleDest = File(releaseDir, bundleOriginalPath).also { it.parentFile?.mkdirs() }
-        fetchByContentHash(resolveObjectUrl(bundleObjectKey), bundleSha256, bundleDest)
+        val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
+            ?: resolveObjectUrl(bundleObjectKey)
+        fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest)
 
         bundlePublicKey?.let { pubKey ->
             if (bundleSignature == null) {
@@ -740,8 +751,10 @@ class NitroPushSdk private constructor(
             val originalPath = a.getString("originalPath")
             val sha256 = a.getString("sha256")
             val objectKey = a.getString("objectKey")
+            val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
+                ?: resolveObjectUrl(objectKey)
             val dest = File(releaseDir, originalPath).also { it.parentFile?.mkdirs() }
-            fetchByContentHash(resolveObjectUrl(objectKey), sha256, dest)
+            fetchByContentHash(assetDownloadUrl, sha256, dest)
 
             // Coarse progress in the absence of byte totals: 1 unit per asset.
             emitProgress(
