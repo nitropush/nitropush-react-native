@@ -1,50 +1,31 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Platform, Pressable, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 
 import {
+  configure,
   configureWith,
   InstallMode,
   sync,
   SyncStatus,
   type DownloadProgress,
   type LocalPackage,
-  type NitroPushClient,
 } from "@nitropush/react-native";
 
-/**
- * Android emulators see `localhost` as the emulator itself, not the host
- * machine — the host is reachable at `10.0.2.2`. iOS simulators share the
- * host's loopback so `localhost` works there. Auto-rewrite for dev so the
- * same `.env` works on both targets.
- */
-function resolveServerUrl(raw: string): string {
-  if (Platform.OS !== "android") return raw;
-  return raw.replace(/\/\/(localhost|127\.0\.0\.1)(?=[:/]|$)/, "//10.0.2.2");
-}
 
-const NITROPUSH_SERVER_URL = resolveServerUrl(
-  (process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL as string | undefined) ??
-    "https://nitropush.example.com",
-);
-const DEPLOYMENT_KEY =
-  (process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY as string | undefined) ??
-  "PROD-CHANGEME";
-const STORAGE_BASE_URL = resolveServerUrl(
-  (process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL as string | undefined) ??
-    "https://cdn.nitropush.example.com",
-);
-
-// Build the client once at module scope. `configureWith` returns a
-// `NitroPushClient` whose methods (`checkForUpdate`, `notifyAppReady`,
-// `restartApp`, `getCurrentPackage`, …) drive the rest of the flow.
-const client: NitroPushClient = configureWith({
-  serverUrl: NITROPUSH_SERVER_URL,
-  deploymentKey: DEPLOYMENT_KEY,
-  storageBaseUrl: STORAGE_BASE_URL,
-});
+// Build the client once at module scope.
+// In dev: EXPO_PUBLIC_* env vars (from .env) point at the local server.
+// In production: fall back to Info.plist / AndroidManifest values baked
+// in by the config plugin (no-arg configure() path).
+const client = process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY
+  ? configureWith({
+      serverUrl:      process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL      ?? "",
+      deploymentKey:  process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY  ?? "",
+      storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL ?? "",
+    })
+  : configure();
 
 export default function HomeScreen() {
   // First-paint reads via the sync helper — avoids a microtask hop so the
@@ -103,10 +84,6 @@ export default function HomeScreen() {
   return (
     <ThemedView style={styles.root}>
       <ThemedText type="title">NitroPush demo</ThemedText>
-      <ThemedText style={styles.subtitle}>API: {NITROPUSH_SERVER_URL}</ThemedText>
-      <ThemedText style={styles.subtitle}>
-        Storage: {STORAGE_BASE_URL}
-      </ThemedText>
       <ThemedText style={styles.subtitle}>
         Version: {meta?.displayVersion ?? meta?.label ?? "binary bundle"}
       </ThemedText>
