@@ -101,7 +101,7 @@ import {
     deploymentKey?: string;
     /**
      * Object-storage base URL for bundle downloads (e.g. your MinIO / S3
-     * bucket URL). Required when `serverUrl` is set.
+     * bucket URL). Injected into Info.plist / AndroidManifest.
      */
     storageBaseUrl?: string;
     /**
@@ -110,6 +110,18 @@ import {
      * Only required when your releases are signed (`--signing-key` on upload).
      */
     bundlePublicKey?: string;
+    /**
+     * Inject a native `configure()` + background update-check `Task.detached`
+     * into `AppDelegate.swift`. Only needed for **bare React Native** apps that
+     * want the SDK initialised before the JS engine starts.
+     *
+     * In **Expo** apps leave this `false` (the default): the JS-side no-arg
+     * `configure()` call reads `NITROPUSH_*` from Info.plist instead, which the
+     * plugin already injects via `withInfoPlist`.
+     *
+     * Default: `false`.
+     */
+    nativeConfigure?: boolean;
   }
   
   const withNitroPush: ConfigPlugin<NitroPushPluginProps | void> = (
@@ -123,6 +135,7 @@ import {
       deploymentKey: props?.deploymentKey ?? "",
       storageBaseUrl: props?.storageBaseUrl ?? "",
       bundlePublicKey: props?.bundlePublicKey ?? "",
+      nativeConfigure: props?.nativeConfigure ?? false,
     };
 
     // ── iOS Info.plist keys ────────────────────────────────────────────────
@@ -181,6 +194,7 @@ import {
             deploymentKey: opts.deploymentKey || undefined,
             storageBaseUrl: opts.storageBaseUrl || undefined,
             bundlePublicKey: opts.bundlePublicKey || undefined,
+            nativeConfigure: opts.nativeConfigure,
           },
         );
         return cfg;
@@ -401,6 +415,7 @@ import {
       deploymentKey?: string;
       storageBaseUrl?: string;
       bundlePublicKey?: string;
+      nativeConfigure?: boolean;
     } = {},
   ): string {
     let src = contents;
@@ -416,7 +431,9 @@ import {
     }).contents;
   
     // 2. configure() + background update-check — before the RN factory setup.
-    if (opts.serverUrl && opts.deploymentKey) {
+    // Only injected when nativeConfigure=true (bare-RN pattern).
+    // Expo apps skip this; JS calls the no-arg configure() which reads from Info.plist.
+    if (opts.nativeConfigure && opts.serverUrl && opts.deploymentKey) {
       const storageUrl = opts.storageBaseUrl || "https://cdn.nitropush.org";
       const configLines: string[] = [
         "    do {",
