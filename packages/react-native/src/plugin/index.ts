@@ -180,6 +180,7 @@ import {
             serverUrl: opts.serverUrl || undefined,
             deploymentKey: opts.deploymentKey || undefined,
             storageBaseUrl: opts.storageBaseUrl || undefined,
+            bundlePublicKey: opts.bundlePublicKey || undefined,
           },
         );
         return cfg;
@@ -399,6 +400,7 @@ import {
       serverUrl?: string;
       deploymentKey?: string;
       storageBaseUrl?: string;
+      bundlePublicKey?: string;
     } = {},
   ): string {
     let src = contents;
@@ -415,14 +417,16 @@ import {
   
     // 2. configure() + background update-check — before the RN factory setup.
     if (opts.serverUrl && opts.deploymentKey) {
+      const storageUrl = opts.storageBaseUrl || "https://cdn.nitropush.org";
       const configLines: string[] = [
         "    do {",
-        "      try NitroPushSdk.shared.configure(NlConfig(",
+        "      try NitroPushSdk.shared.configure(NPConfig(",
         `        serverUrl:      ${JSON.stringify(opts.serverUrl)},`,
         `        deploymentKey:  ${JSON.stringify(opts.deploymentKey)},`,
+        `        storageBaseUrl: ${JSON.stringify(storageUrl)}`,
       ];
-      if (opts.storageBaseUrl) {
-        configLines.push(`        storageBaseUrl: ${JSON.stringify(opts.storageBaseUrl)}`);
+      if (opts.bundlePublicKey) {
+        configLines.push(`        bundlePublicKey: ${JSON.stringify(opts.bundlePublicKey)}`);
       }
       configLines.push(
         "      ))",
