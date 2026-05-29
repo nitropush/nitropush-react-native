@@ -4,17 +4,17 @@ import com.margelo.nitro.core.Promise
 import com.margelo.nitro.nitropush.HybridLocalPackageSpec
 import com.margelo.nitro.nitropush.InstallMode
 import com.nitropush.sdk.NitroPushSdk
-import com.nitropush.sdk.NlInstallMode
-import com.nitropush.sdk.NlLocalPackage
+import com.nitropush.sdk.NPInstallMode
+import com.nitropush.sdk.NPLocalPackage
 
 /**
  * Kotlin counterpart of `ios/HybridLocalPackage.swift`. HybridObject wrapping
- * a single [NlLocalPackage] snapshot. Returned from
+ * a single [NPLocalPackage] snapshot. Returned from
  * [HybridRemotePackage.download] and the inspection methods on
  * [HybridNitroPushClient] (`getCurrentPackage`, `getPendingPackage`).
  */
 internal class HybridLocalPackage(
-  private val plain: NlLocalPackage,
+  private val plain: NPLocalPackage,
 ) : HybridLocalPackageSpec() {
 
   // ── Properties ────────────────────────────────────────────────────────────
@@ -50,9 +50,9 @@ internal class HybridLocalPackage(
   }
 }
 
-private fun InstallMode.toPlain(): NlInstallMode = when (this) {
-  InstallMode.IMMEDIATE -> NlInstallMode.IMMEDIATE
-  InstallMode.ON_NEXT_RESTART -> NlInstallMode.ON_NEXT_RESTART
-  InstallMode.ON_NEXT_RESUME -> NlInstallMode.ON_NEXT_RESUME
-  InstallMode.ON_NEXT_SUSPEND -> NlInstallMode.ON_NEXT_SUSPEND
+private fun InstallMode.toPlain(): NPInstallMode = when (this) {
+  InstallMode.IMMEDIATE -> NPInstallMode.IMMEDIATE
+  InstallMode.ON_NEXT_RESTART -> NPInstallMode.ON_NEXT_RESTART
+  InstallMode.ON_NEXT_RESUME -> NPInstallMode.ON_NEXT_RESUME
+  InstallMode.ON_NEXT_SUSPEND -> NPInstallMode.ON_NEXT_SUSPEND
 }

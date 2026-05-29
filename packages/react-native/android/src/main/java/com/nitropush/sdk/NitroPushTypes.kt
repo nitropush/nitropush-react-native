@@ -6,7 +6,7 @@ package com.nitropush.sdk
  * core has zero Nitro / fbjni dependency. The Nitro bridge translates
  * between these and the auto-generated Nitrogen types.
  */
-data class NlConfig(
+data class NPConfig(
     val deploymentKey: String,
     val serverUrl: String = "https://api.nitropush.org",
     /** Public base URL where bundles + assets live. Joined with each
@@ -23,7 +23,7 @@ data class NlConfig(
     val bundlePublicKey: String? = null,
 )
 
-data class NlRemotePackage(
+data class NPRemotePackage(
     val releaseId: String,
     /** "codepush" (tarball) or "expo" (manifest). */
     val kind: String,
@@ -39,12 +39,12 @@ data class NlRemotePackage(
     val platforms: Array<String>?,
     val isMandatory: Boolean,
     val description: String?,
-    /** Bucket-relative key. SDK joins with `NlConfig.storageBaseUrl`.
+    /** Bucket-relative key. SDK joins with `NPConfig.storageBaseUrl`.
      *  Codepush → tarball key; expo → manifest key. */
     val downloadObjectKey: String,
 )
 
-data class NlLocalPackage(
+data class NPLocalPackage(
     val releaseId: String,
     val label: String,
     val packageHash: String,
@@ -63,6 +63,6 @@ data class NlLocalPackage(
     companion object
 }
 
-data class NlDownloadProgress(val receivedBytes: Double, val totalBytes: Double)
+data class NPDownloadProgress(val receivedBytes: Double, val totalBytes: Double)
 
-enum class NlInstallMode { IMMEDIATE, ON_NEXT_RESTART, ON_NEXT_RESUME, ON_NEXT_SUSPEND }
+enum class NPInstallMode { IMMEDIATE, ON_NEXT_RESTART, ON_NEXT_RESUME, ON_NEXT_SUSPEND }

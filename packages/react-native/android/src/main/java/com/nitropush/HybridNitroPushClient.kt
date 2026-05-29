@@ -53,7 +53,7 @@ internal class HybridNitroPushClient : HybridNitroPushClientSpec() {
 }
 
 private fun wrapLocal(
-  pkg: com.nitropush.sdk.NlLocalPackage?,
+  pkg: com.nitropush.sdk.NPLocalPackage?,
 ): Variant_NullType_HybridLocalPackageSpec =
   if (pkg == null) {
     Variant_NullType_HybridLocalPackageSpec.First(NullType.NULL)

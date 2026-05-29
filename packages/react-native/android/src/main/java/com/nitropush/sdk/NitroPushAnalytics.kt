@@ -20,7 +20,7 @@ import kotlin.math.min
  * One JS-shaped analytics event. Wire matches the existing `/api/sdk/events`
  * contract — moving from JS to native must not change the server schema.
  */
-internal data class NlAnalyticsEvent(
+internal data class NPAnalyticsEvent(
     val eventType: String,
     val clientUniqueId: String,
     val appVersion: String,
@@ -41,7 +41,7 @@ internal data class NlAnalyticsEvent(
  * **Threading.** All queue mutation runs on the single-thread executor;
  * callers can hammer [enqueue] from any thread without locking.
  */
-internal class NlAnalytics(
+internal class NPAnalytics(
     serverUrl: String,
     private val deploymentKey: String,
     private val capacity: Int = 200,
@@ -57,13 +57,13 @@ internal class NlAnalytics(
             Thread(r, "nitropush-analytics").apply { isDaemon = true }
         }
 
-    private val queue = ArrayDeque<NlAnalyticsEvent>()
+    private val queue = ArrayDeque<NPAnalyticsEvent>()
     @Volatile private var flushing = false
     @Volatile private var stopped = false
     private var backoffMs: Long = 0
     private var pendingTimer: ScheduledFuture<*>? = null
 
-    fun enqueue(event: NlAnalyticsEvent) {
+    fun enqueue(event: NPAnalyticsEvent) {
         executor.execute {
             if (stopped) return@execute
             queue.addLast(event)
@@ -132,7 +132,7 @@ internal class NlAnalytics(
         }
     }
 
-    private fun postBatch(batch: List<NlAnalyticsEvent>): Boolean {
+    private fun postBatch(batch: List<NPAnalyticsEvent>): Boolean {
         val url = try {
             URL("$serverUrl/api/sdk/events")
         } catch (_: Throwable) {
@@ -168,7 +168,7 @@ internal class NlAnalytics(
     }
 }
 
-private fun NlAnalyticsEvent.toJson(): JSONObject {
+private fun NPAnalyticsEvent.toJson(): JSONObject {
     val obj = JSONObject()
     obj.put("eventType", eventType)
     obj.put("clientUniqueId", clientUniqueId)
@@ -186,7 +186,7 @@ private fun NlAnalyticsEvent.toJson(): JSONObject {
  * Helpers shared between [NitroPushSdk] and the rollback sweep so events
  * tag with the same device fields regardless of who fires them.
  */
-internal object NlAnalyticsContext {
+internal object NPAnalyticsContext {
     private val ISO: ThreadLocal<SimpleDateFormat> = ThreadLocal.withInitial {
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
