@@ -45,8 +45,8 @@
       [
         "@nitropush/react-native",
         {
-          "ios": true,
-          "android": true
+          "serverUrl": "https://api.nitropush.org",
+          "deploymentKey": "nl_test_eCRLfzr07MDeCjrOc_P1MoGkpXIBUj7JyHtCCasNlK4"
         }
       ],
       [

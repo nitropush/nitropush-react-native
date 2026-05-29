@@ -64,10 +64,13 @@
  */
 
 import {
+    AndroidConfig,
     type ConfigPlugin,
     createRunOncePlugin,
+    withAndroidManifest,
     withAppDelegate,
     withDangerousMod,
+    withInfoPlist,
     withMainApplication,
   } from "@expo/config-plugins";
   import { mergeContents } from "@expo/config-plugins/build/utils/generateCode";
@@ -101,6 +104,12 @@ import {
      * bucket URL). Required when `serverUrl` is set.
      */
     storageBaseUrl?: string;
+    /**
+     * Base64-encoded DER SPKI public key used to verify bundle signatures.
+     * Injected as `NITROPUSH_BUNDLE_PUBLIC_KEY` in Info.plist / AndroidManifest.
+     * Only required when your releases are signed (`--signing-key` on upload).
+     */
+    bundlePublicKey?: string;
   }
   
   const withNitroPush: ConfigPlugin<NitroPushPluginProps | void> = (
@@ -113,8 +122,51 @@ import {
       serverUrl: props?.serverUrl ?? "",
       deploymentKey: props?.deploymentKey ?? "",
       storageBaseUrl: props?.storageBaseUrl ?? "",
+      bundlePublicKey: props?.bundlePublicKey ?? "",
     };
-  
+
+    // ── iOS Info.plist keys ────────────────────────────────────────────────
+    // The no-arg `configure()` call reads NITROPUSH_* from Info.plist; inject
+    // them whenever the plugin has values for them.
+    if (opts.ios && opts.deploymentKey) {
+      config = withInfoPlist(config, (cfg) => {
+        cfg.modResults["NITROPUSH_DEPLOYMENT_KEY"] = opts.deploymentKey;
+        if (opts.serverUrl)       cfg.modResults["NITROPUSH_SERVER_URL"]       = opts.serverUrl;
+        if (opts.storageBaseUrl)  cfg.modResults["NITROPUSH_STORAGE_BASE_URL"] = opts.storageBaseUrl;
+        if (opts.bundlePublicKey) cfg.modResults["NITROPUSH_BUNDLE_PUBLIC_KEY"]= opts.bundlePublicKey;
+        return cfg;
+      });
+    }
+
+    // ── Android <meta-data> ───────────────────────────────────────────────
+    // Mirror of the iOS keys; the SDK reads them from AndroidManifest <application>.
+    if (opts.android && opts.deploymentKey) {
+      config = withAndroidManifest(config, (cfg) => {
+        const mainApp = AndroidConfig.Manifest.getMainApplication(cfg.modResults);
+        if (!mainApp) return cfg;
+        const MANAGED_KEYS = [
+          "NITROPUSH_DEPLOYMENT_KEY",
+          "NITROPUSH_SERVER_URL",
+          "NITROPUSH_STORAGE_BASE_URL",
+          "NITROPUSH_BUNDLE_PUBLIC_KEY",
+        ];
+        // Remove stale entries first (idempotent re-runs).
+        mainApp["meta-data"] = (mainApp["meta-data"] ?? []).filter(
+          (m) => !MANAGED_KEYS.includes(m.$["android:name"]),
+        );
+        const entries: [string, string][] = [
+          ["NITROPUSH_DEPLOYMENT_KEY", opts.deploymentKey],
+        ];
+        if (opts.serverUrl)       entries.push(["NITROPUSH_SERVER_URL",        opts.serverUrl]);
+        if (opts.storageBaseUrl)  entries.push(["NITROPUSH_STORAGE_BASE_URL",  opts.storageBaseUrl]);
+        if (opts.bundlePublicKey) entries.push(["NITROPUSH_BUNDLE_PUBLIC_KEY", opts.bundlePublicKey]);
+        for (const [name, value] of entries) {
+          mainApp["meta-data"].push({ $: { "android:name": name, "android:value": value } });
+        }
+        return cfg;
+      });
+    }
+
     if (opts.ios) {
       config = withAppDelegate(config, (cfg) => {
         if (cfg.modResults.language !== "swift") {
