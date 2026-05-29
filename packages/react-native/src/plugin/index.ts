@@ -433,19 +433,26 @@ import {
     // 2. configure() + background update-check — before the RN factory setup.
     // Only injected when nativeConfigure=true (bare-RN pattern).
     // Expo apps skip this; JS calls the no-arg configure() which reads from Info.plist.
-    if (opts.nativeConfigure && opts.serverUrl && opts.deploymentKey) {
-      const storageUrl = opts.storageBaseUrl || "https://cdn.nitropush.org";
+    if (opts.nativeConfigure && opts.deploymentKey) {
+      // Build NPConfig args — only include URL overrides when non-default.
+      const DEFAULT_SERVER = "https://api.nitropush.org";
+      const DEFAULT_CDN    = "https://cdn.nitropush.org";
+      const configArgs: string[] = [
+        `        deploymentKey:  ${JSON.stringify(opts.deploymentKey)}`,
+      ];
+      if (opts.serverUrl && opts.serverUrl !== DEFAULT_SERVER) {
+        configArgs.push(`        serverUrl:      ${JSON.stringify(opts.serverUrl)}`);
+      }
+      if (opts.storageBaseUrl && opts.storageBaseUrl !== DEFAULT_CDN) {
+        configArgs.push(`        storageBaseUrl: ${JSON.stringify(opts.storageBaseUrl)}`);
+      }
+      if (opts.bundlePublicKey) {
+        configArgs.push(`        bundlePublicKey: ${JSON.stringify(opts.bundlePublicKey)}`);
+      }
       const configLines: string[] = [
         "    do {",
-        "      try NitroPushSdk.shared.configure(NPConfig(",
-        `        serverUrl:      ${JSON.stringify(opts.serverUrl)},`,
-        `        deploymentKey:  ${JSON.stringify(opts.deploymentKey)},`,
-        `        storageBaseUrl: ${JSON.stringify(storageUrl)}`,
-      ];
-      if (opts.bundlePublicKey) {
-        configLines.push(`        bundlePublicKey: ${JSON.stringify(opts.bundlePublicKey)}`);
-      }
-      configLines.push(
+        `      try NitroPushSdk.shared.configure(NPConfig(`,
+        ...configArgs.map((a, i) => a + (i < configArgs.length - 1 ? "," : "")),
         "      ))",
         "    } catch {",
         '      NSLog("[NitroPush] configure failed: %@", "\\(error)")',
@@ -460,7 +467,7 @@ import {
         '        NSLog("[NitroPush] background sync failed: %@", "\\(error)")',
         "      }",
         "    }",
-      );
+      ];
   
       try {
         src = mergeContents({

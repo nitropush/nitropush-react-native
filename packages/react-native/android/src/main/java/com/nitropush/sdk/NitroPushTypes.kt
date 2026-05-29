@@ -7,11 +7,11 @@ package com.nitropush.sdk
  * between these and the auto-generated Nitrogen types.
  */
 data class NlConfig(
-    val serverUrl: String,
     val deploymentKey: String,
+    val serverUrl: String = "https://api.nitropush.org",
     /** Public base URL where bundles + assets live. Joined with each
      *  `objectKey` at fetch time. */
-    val storageBaseUrl: String,
+    val storageBaseUrl: String = "https://cdn.nitropush.org",
     val appVersion: String? = null,
     val clientUniqueId: String? = null,
     /**
