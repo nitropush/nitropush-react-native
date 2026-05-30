@@ -5,18 +5,18 @@ import com.margelo.nitro.nitropush.DownloadProgress
 import com.margelo.nitro.nitropush.HybridLocalPackageSpec
 import com.margelo.nitro.nitropush.HybridRemotePackageSpec
 import com.nitropush.sdk.NitroPushSdk
-import com.nitropush.sdk.NlDownloadProgress
-import com.nitropush.sdk.NlRemotePackage
+import com.nitropush.sdk.NPDownloadProgress
+import com.nitropush.sdk.NPRemotePackage
 
 /**
  * Kotlin counterpart of `ios/HybridRemotePackage.swift`. HybridObject wrapping
- * a single [NlRemotePackage] snapshot returned from
+ * a single [NPRemotePackage] snapshot returned from
  * [HybridNitroPushClient.checkForUpdate]. Owns the [download] method so
  * callers can drive the lifecycle on the package itself, including a
  * per-download progress callback.
  */
 internal class HybridRemotePackage(
-  private val plain: NlRemotePackage,
+  private val plain: NPRemotePackage,
 ) : HybridRemotePackageSpec() {
 
   // ── Properties ────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ internal class HybridRemotePackage(
   }
 }
 
-private fun NlDownloadProgress.toNitro() = DownloadProgress(
+private fun NPDownloadProgress.toNitro() = DownloadProgress(
   receivedBytes = receivedBytes,
   totalBytes = totalBytes,
 )

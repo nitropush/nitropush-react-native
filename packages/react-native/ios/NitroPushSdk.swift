@@ -85,6 +85,10 @@ public final class NitroPushSdk {
     private var progressListeners: [Int: (NPDownloadProgress) -> Void] = [:]
     private var nextListenerId: Int = 1
 
+    /// Keyed by releaseId — pre-signed manifest proxy URL from the server.
+    /// Populated in checkForUpdate; consumed by downloadManifestRelease.
+    private var manifestUrlOverride: [String: String] = [:]
+
     private var pendingResumeAfterBackground: (NPLocalPackage, TimeInterval)?
     private var pendingSuspend: NPLocalPackage?
     private var lastBackgroundedAt: Date?
@@ -544,7 +548,12 @@ public final class NitroPushSdk {
                                       reason: "checkForUpdate JSON decode failed: \(error)")
             )
         }
-        return parsed.release
+        // Cache the pre-signed manifest proxy URL so downloadManifestRelease
+        // uses it instead of constructing an unsigned storageBaseUrl + objectKey.
+        if let wrapper = parsed.release, let proxyUrl = wrapper.downloadUrl {
+            manifestUrlOverride[wrapper.pkg.releaseId] = proxyUrl
+        }
+        return parsed.release?.pkg
     }
 
     /// Build a self-diagnosing error string for an HTTP fetch that didn't
@@ -601,7 +610,15 @@ public final class NitroPushSdk {
     /// relative-to-bundle asset resolution still works. Used for both
     /// `expo` and `codepush` kinds — the manifest format is identical.
     private func downloadManifestRelease(pkg: NPRemotePackage, releaseDir: URL) async throws -> String {
-        let url = try resolveObjectURL(pkg.downloadObjectKey)
+        // Prefer the server-issued downloadUrl (manifest proxy with signed asset URLs)
+        // over constructing an unsigned CDN URL from storageBaseUrl + objectKey.
+        let url: URL
+        if let directUrl = manifestUrlOverride[pkg.releaseId],
+           let parsed = URL(string: directUrl) {
+            url = parsed
+        } else {
+            url = try resolveObjectURL(pkg.downloadObjectKey)
+        }
         log("downloadManifestRelease", "GET \(url.absoluteString)")
         let (manifestData, response) = try await session.data(from: url)
         let http = response as? HTTPURLResponse
@@ -630,8 +647,10 @@ public final class NitroPushSdk {
             at: bundleDest.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        let bundleDownloadUrl = manifest.bundle.downloadUrl
+            ?? (try resolveObjectURL(manifest.bundle.objectKey).absoluteString)
         try await fetchByContentHash(
-            urlString: try resolveObjectURL(manifest.bundle.objectKey).absoluteString,
+            urlString: bundleDownloadUrl,
             sha256: manifest.bundle.sha256,
             dest: bundleDest
         )
@@ -662,8 +681,10 @@ public final class NitroPushSdk {
                 at: dest.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            let assetDownloadUrl = asset.downloadUrl
+                ?? (try resolveObjectURL(asset.objectKey).absoluteString)
             try await fetchByContentHash(
-                urlString: try resolveObjectURL(asset.objectKey).absoluteString,
+                urlString: assetDownloadUrl,
                 sha256: asset.sha256,
                 dest: dest
             )
@@ -759,6 +780,9 @@ private struct SdkManifestBundle: Decodable {
     let originalPath: String
     let sha256: String
     let objectKey: String
+    /// Pre-signed download URL returned by the manifest proxy endpoint.
+    /// When present, used directly instead of storageBaseUrl + objectKey.
+    let downloadUrl: String?
     /// Base64 DER ECDSA P-256 signature over `"bundle:<sha256>"`.
     /// Present only when the release was created with a signing key.
     let signature: String?
@@ -769,6 +793,8 @@ private struct SdkManifestAsset: Decodable {
     let ext: String
     let sha256: String
     let objectKey: String
+    /// Pre-signed download URL returned by the manifest proxy endpoint.
+    let downloadUrl: String?
 }
 
 extension NitroPushSdk {
@@ -945,8 +971,23 @@ extension NitroPushSdk {
     }
 }
 
+/// Wraps `NPRemotePackage` so we can also capture the optional `downloadUrl`
+/// field alongside it without modifying the Nitro-generated type.
+private struct LatestReleaseWrapper: Decodable {
+    let pkg: NPRemotePackage
+    let downloadUrl: String?
+
+    private enum ExtraKeys: String, CodingKey { case downloadUrl }
+
+    init(from decoder: Decoder) throws {
+        pkg = try NPRemotePackage(from: decoder)
+        let c = try decoder.container(keyedBy: ExtraKeys.self)
+        downloadUrl = try c.decodeIfPresent(String.self, forKey: .downloadUrl)
+    }
+}
+
 private struct LatestReleaseResponse: Decodable {
-    let release: NPRemotePackage?
+    let release: LatestReleaseWrapper?
 }
 
 extension NPRemotePackage: Decodable {

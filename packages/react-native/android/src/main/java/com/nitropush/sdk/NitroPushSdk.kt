@@ -90,14 +90,14 @@ class NitroPushSdk private constructor(
         }
 
         /**
-         * Build an [NlConfig] by reading `NITROPUSH_*` keys from the app's
+         * Build an [NPConfig] by reading `NITROPUSH_*` keys from the app's
          * `<application>` `<meta-data>` tags in `AndroidManifest.xml`. Mirror
          * of iOS's `configFromInfoPlist()`. Only `NITROPUSH_DEPLOYMENT_KEY` is
          * required — server and storage URLs fall back to the NitroPush-hosted
          * endpoints when absent.
          */
         @JvmStatic
-        fun configFromManifest(): NlConfig {
+        fun configFromManifest(): NPConfig {
             val ctx = shared.applicationContext
             val ai = ctx.packageManager.getApplicationInfo(
                 ctx.packageName,
@@ -107,7 +107,7 @@ class NitroPushSdk private constructor(
                 ?: error("AndroidManifest.xml is missing NITROPUSH_DEPLOYMENT_KEY <meta-data>")
             val deploymentKey = meta.getString("NITROPUSH_DEPLOYMENT_KEY")
                 ?: error("missing NITROPUSH_DEPLOYMENT_KEY in AndroidManifest meta-data")
-            return NlConfig(
+            return NPConfig(
                 serverUrl = meta.getString("NITROPUSH_SERVER_URL") ?: "https://api.nitropush.org",
                 deploymentKey = deploymentKey,
                 storageBaseUrl = meta.getString("NITROPUSH_STORAGE_BASE_URL") ?: "https://cdn.nitropush.org",
@@ -160,11 +160,14 @@ class NitroPushSdk private constructor(
      *  signature verification. `null` means verification is skipped. */
     private var bundlePublicKey: String? = null
 
-    private val progressListeners = mutableMapOf<Int, (NlDownloadProgress) -> Unit>()
+    private val progressListeners = mutableMapOf<Int, (NPDownloadProgress) -> Unit>()
     private var nextListenerId = 1
 
-    private var pendingResume: Pair<NlLocalPackage, Long>? = null
-    private var pendingSuspend: NlLocalPackage? = null
+    /** releaseId → pre-signed manifest proxy URL from the server. */
+    private val manifestUrlOverride = mutableMapOf<String, String>()
+
+    private var pendingResume: Pair<NPLocalPackage, Long>? = null
+    private var pendingSuspend: NPLocalPackage? = null
     private var lastBackgroundedAt: Long = 0
 
     /**
@@ -172,7 +175,7 @@ class NitroPushSdk private constructor(
      * `createAnalyticsEmitter` so events fire even when the JS thread
      * hasn't loaded (cold-start, post-rollback boots).
      */
-    private var analytics: NlAnalytics? = null
+    private var analytics: NPAnalytics? = null
 
     /**
      * Rollback releases we've already reported this process — keeps
@@ -186,7 +189,7 @@ class NitroPushSdk private constructor(
      */
     private val reportedFirstRuns = mutableSetOf<String>()
 
-    fun configure(config: NlConfig) {
+    fun configure(config: NPConfig) {
         log("configure") {
             "serverUrl=${config.serverUrl} deploymentKey=${config.deploymentKey.take(20)}… " +
                 "storageBaseUrl=${config.storageBaseUrl} appVersion=${config.appVersion ?: "(auto)"}"
@@ -203,7 +206,7 @@ class NitroPushSdk private constructor(
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
         analytics?.stop()
-        analytics = NlAnalytics(
+        analytics = NPAnalytics(
             serverUrl = config.serverUrl,
             deploymentKey = config.deploymentKey,
         )
@@ -224,7 +227,7 @@ class NitroPushSdk private constructor(
     }
 
     /** Blocking. Run on a worker thread (the Nitro bridge uses Promise.async). */
-    fun checkForUpdate(deploymentKeyOverride: String? = null): NlRemotePackage? {
+    fun checkForUpdate(deploymentKeyOverride: String? = null): NPRemotePackage? {
         log("checkForUpdate") { "deploymentKeyOverride=${deploymentKeyOverride?.take(20) ?: "(none)"}" }
         val r = requestLatestRelease(deploymentKeyOverride ?: deploymentKey)
         log("checkForUpdate → result") {
@@ -241,7 +244,7 @@ class NitroPushSdk private constructor(
     }
 
     /** Blocking. Emits progress synchronously on the calling thread. */
-    fun downloadUpdate(pkg: NlRemotePackage): NlLocalPackage {
+    fun downloadUpdate(pkg: NPRemotePackage): NPLocalPackage {
         log("downloadUpdate") { "releaseId=${pkg.releaseId} label=${pkg.label} kind=${pkg.kind}" }
         emit(
             type = "download_started",
@@ -266,8 +269,8 @@ class NitroPushSdk private constructor(
     }
 
     fun installUpdate(
-        pkg: NlLocalPackage,
-        installMode: NlInstallMode,
+        pkg: NPLocalPackage,
+        installMode: NPInstallMode,
         minimumBackgroundDurationSeconds: Double,
     ) {
         log("installUpdate") {
@@ -275,19 +278,19 @@ class NitroPushSdk private constructor(
         }
         persistPending(pkg)
         when (installMode) {
-            NlInstallMode.IMMEDIATE -> {
+            NPInstallMode.IMMEDIATE -> {
                 log("installUpdate.IMMEDIATE → activate + reload")
                 activatePending()
                 reloadBridge()
             }
-            NlInstallMode.ON_NEXT_RESTART -> {
+            NPInstallMode.ON_NEXT_RESTART -> {
                 log("installUpdate.ON_NEXT_RESTART") { "staged; will activate on next cold start" }
             }
-            NlInstallMode.ON_NEXT_RESUME -> {
+            NPInstallMode.ON_NEXT_RESUME -> {
                 pendingResume = pkg to (minimumBackgroundDurationSeconds.toLong() * 1000L)
                 log("installUpdate.ON_NEXT_RESUME") { "scheduled after ≥${minimumBackgroundDurationSeconds}s background" }
             }
-            NlInstallMode.ON_NEXT_SUSPEND -> {
+            NPInstallMode.ON_NEXT_SUSPEND -> {
                 pendingSuspend = pkg
                 log("installUpdate.ON_NEXT_SUSPEND") { "will activate when app goes background" }
             }
@@ -332,8 +335,8 @@ class NitroPushSdk private constructor(
         reloadBridge()
     }
 
-    fun getCurrentPackage(): NlLocalPackage? = readActive()
-    fun getPendingPackage(): NlLocalPackage? = readPending()
+    fun getCurrentPackage(): NPLocalPackage? = readActive()
+    fun getPendingPackage(): NPLocalPackage? = readPending()
 
     fun clearPendingUpdate() {
         val pending = readPending()
@@ -401,7 +404,7 @@ class NitroPushSdk private constructor(
         File(applicationContext.filesDir, "nitropush").deleteRecursively()
     }
 
-    fun addDownloadProgressListener(callback: (NlDownloadProgress) -> Unit): Int {
+    fun addDownloadProgressListener(callback: (NPDownloadProgress) -> Unit): Int {
         val id = nextListenerId++
         progressListeners[id] = callback
         return id
@@ -411,7 +414,7 @@ class NitroPushSdk private constructor(
         progressListeners.remove(listenerId)
     }
 
-    private fun emitProgress(progress: NlDownloadProgress) {
+    private fun emitProgress(progress: NPDownloadProgress) {
         val snapshot = progressListeners.values.toList()
         Handler(Looper.getMainLooper()).post {
             snapshot.forEach { it(progress) }
@@ -431,16 +434,16 @@ class NitroPushSdk private constructor(
     ) {
         val a = analytics ?: return
         a.enqueue(
-            NlAnalyticsEvent(
+            NPAnalyticsEvent(
                 eventType = type,
                 clientUniqueId = clientUniqueId ?: fallbackDeviceId(),
                 appVersion = appVersion ?: this.appVersion ?: "*",
                 otaVersion = otaVersion,
                 releaseId = releaseId,
                 platform = "android",
-                osVersion = NlAnalyticsContext.osVersion(),
-                deviceModel = NlAnalyticsContext.deviceModel(),
-                occurredAt = NlAnalyticsContext.now(),
+                osVersion = NPAnalyticsContext.osVersion(),
+                deviceModel = NPAnalyticsContext.deviceModel(),
+                occurredAt = NPAnalyticsContext.now(),
             )
         )
     }
@@ -455,7 +458,7 @@ class NitroPushSdk private constructor(
         val raw = prefs.getString(Keys.PENDING_ROLLBACK_EVENT, null) ?: return
         prefs.edit().remove(Keys.PENDING_ROLLBACK_EVENT).apply()
         val rolled = try {
-            NlLocalPackage.fromJson(JSONObject(raw))
+            NPLocalPackage.fromJson(JSONObject(raw))
         } catch (_: Throwable) {
             return
         }
@@ -575,7 +578,7 @@ class NitroPushSdk private constructor(
         }
     }
 
-    private fun requestLatestRelease(deploymentKey: String?): NlRemotePackage? {
+    private fun requestLatestRelease(deploymentKey: String?): NPRemotePackage? {
         val server = serverUrl ?: error("NitroPushSdk.configure(...) was not called.")
         val key = deploymentKey ?: error("deploymentKey not set")
 
@@ -634,7 +637,7 @@ class NitroPushSdk private constructor(
             val platforms = if (platformsArr != null) {
                 Array(platformsArr.length()) { platformsArr.getString(it) }
             } else null
-            return NlRemotePackage(
+            val pkg = NPRemotePackage(
                 releaseId = r.getString("releaseId"),
                 kind = r.optString("kind", "codepush"),
                 label = r.getString("label"),
@@ -649,12 +652,17 @@ class NitroPushSdk private constructor(
                 description = r.optString("description").takeIf { it.isNotEmpty() },
                 downloadObjectKey = r.getString("downloadObjectKey"),
             )
+            // Cache the pre-signed manifest proxy URL for use in downloadManifestRelease.
+            r.optString("downloadUrl").takeIf { it.isNotEmpty() }?.let {
+                manifestUrlOverride[pkg.releaseId] = it
+            }
+            return pkg
         } finally {
             conn.disconnect()
         }
     }
 
-    private fun performDownload(pkg: NlRemotePackage): NlLocalPackage {
+    private fun performDownload(pkg: NPRemotePackage): NPLocalPackage {
         val releaseDir = File(applicationContext.filesDir, "nitropush/${pkg.releaseId}")
         if (releaseDir.exists()) releaseDir.deleteRecursively()
         releaseDir.mkdirs()
@@ -664,7 +672,7 @@ class NitroPushSdk private constructor(
         // kinds — the distinction lives only at the API/DB layer.
         val bundlePath = downloadManifestRelease(pkg, releaseDir)
 
-        return NlLocalPackage(
+        return NPLocalPackage(
             releaseId = pkg.releaseId,
             label = pkg.label,
             packageHash = pkg.packageHash,
@@ -690,8 +698,9 @@ class NitroPushSdk private constructor(
      * RN's relative-to-bundle asset resolution still works. Used for both
      * `expo` and `codepush` kinds — the manifest format is identical.
      */
-    private fun downloadManifestRelease(pkg: NlRemotePackage, releaseDir: File): String {
-        val manifestUrl = resolveObjectUrl(pkg.downloadObjectKey)
+    private fun downloadManifestRelease(pkg: NPRemotePackage, releaseDir: File): String {
+        val manifestUrl = manifestUrlOverride[pkg.releaseId]
+            ?: resolveObjectUrl(pkg.downloadObjectKey)
         log("downloadManifestRelease") { "GET $manifestUrl" }
         val manifestText = httpGetString(manifestUrl)
         val manifest = try {
@@ -717,7 +726,9 @@ class NitroPushSdk private constructor(
         val bundleOriginalPath = bundleObj.getString("originalPath")
         val bundleSignature = bundleObj.optString("signature").takeIf { it.isNotEmpty() }
         val bundleDest = File(releaseDir, bundleOriginalPath).also { it.parentFile?.mkdirs() }
-        fetchByContentHash(resolveObjectUrl(bundleObjectKey), bundleSha256, bundleDest)
+        val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
+            ?: resolveObjectUrl(bundleObjectKey)
+        fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest)
 
         bundlePublicKey?.let { pubKey ->
             if (bundleSignature == null) {
@@ -740,12 +751,14 @@ class NitroPushSdk private constructor(
             val originalPath = a.getString("originalPath")
             val sha256 = a.getString("sha256")
             val objectKey = a.getString("objectKey")
+            val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
+                ?: resolveObjectUrl(objectKey)
             val dest = File(releaseDir, originalPath).also { it.parentFile?.mkdirs() }
-            fetchByContentHash(resolveObjectUrl(objectKey), sha256, dest)
+            fetchByContentHash(assetDownloadUrl, sha256, dest)
 
             // Coarse progress in the absence of byte totals: 1 unit per asset.
             emitProgress(
-                NlDownloadProgress(
+                NPDownloadProgress(
                     receivedBytes = (i + 1).toDouble(),
                     totalBytes = total.toDouble(),
                 )
@@ -799,7 +812,7 @@ class NitroPushSdk private constructor(
                         written += n
                         if (announcedSize > 0) {
                             emitProgress(
-                                NlDownloadProgress(
+                                NPDownloadProgress(
                                     receivedBytes = written.toDouble(),
                                     totalBytes = announcedSize.toDouble(),
                                 )
@@ -825,7 +838,7 @@ class NitroPushSdk private constructor(
      *
      * @param sha256           Hex SHA-256 of the bundle bytes.
      * @param signatureBase64  Base64 DER-encoded ECDSA signature from the manifest.
-     * @param publicKeyBase64  Base64 DER SubjectPublicKeyInfo from [NlConfig.bundlePublicKey].
+     * @param publicKeyBase64  Base64 DER SubjectPublicKeyInfo from [NPConfig.bundlePublicKey].
      * @throws IllegalStateException if the signature is invalid or the key/sig can't be parsed.
      */
     private fun verifyBundleSignature(
@@ -907,7 +920,7 @@ class NitroPushSdk private constructor(
             " body=$snippet"
     }
 
-    private fun persistPending(pkg: NlLocalPackage) {
+    private fun persistPending(pkg: NPLocalPackage) {
         prefs.edit().putString(Keys.PENDING, pkg.toJson().toString()).apply()
     }
 
@@ -922,11 +935,11 @@ class NitroPushSdk private constructor(
         editor.apply()
     }
 
-    private fun readActive(): NlLocalPackage? =
-        prefs.getString(Keys.ACTIVE, null)?.let { NlLocalPackage.fromJson(JSONObject(it)) }
+    private fun readActive(): NPLocalPackage? =
+        prefs.getString(Keys.ACTIVE, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
 
-    private fun readPending(): NlLocalPackage? =
-        prefs.getString(Keys.PENDING, null)?.let { NlLocalPackage.fromJson(JSONObject(it)) }
+    private fun readPending(): NPLocalPackage? =
+        prefs.getString(Keys.PENDING, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
 
     private fun deleteBundleDir(releaseId: String) {
         File(applicationContext.filesDir, "nitropush/$releaseId").deleteRecursively()
@@ -975,7 +988,7 @@ class NitroPushSdk private constructor(
     }
 }
 
-private fun NlLocalPackage.toJson(): JSONObject = JSONObject().apply {
+private fun NPLocalPackage.toJson(): JSONObject = JSONObject().apply {
     put("releaseId", releaseId)
     put("label", label)
     put("packageHash", packageHash)
@@ -996,12 +1009,12 @@ private fun NlLocalPackage.toJson(): JSONObject = JSONObject().apply {
     description?.let { put("description", it) }
 }
 
-private fun NlLocalPackage.Companion.fromJson(obj: JSONObject): NlLocalPackage {
+private fun NPLocalPackage.Companion.fromJson(obj: JSONObject): NPLocalPackage {
     val platformsArr = obj.optJSONArray("platforms")
     val platforms = if (platformsArr != null) {
         Array(platformsArr.length()) { platformsArr.getString(it) }
     } else null
-    return NlLocalPackage(
+    return NPLocalPackage(
         releaseId = obj.getString("releaseId"),
         label = obj.getString("label"),
         packageHash = obj.getString("packageHash"),

@@ -19,9 +19,9 @@ public struct NPConfig {
     public let bundlePublicKey: String?
 
     public init(
-        serverUrl: String,
         deploymentKey: String,
-        storageBaseUrl: String,
+        serverUrl: String = "https://api.nitropush.org",
+        storageBaseUrl: String = "https://cdn.nitropush.org",
         appVersion: String? = nil,
         clientUniqueId: String? = nil,
         bundlePublicKey: String? = nil

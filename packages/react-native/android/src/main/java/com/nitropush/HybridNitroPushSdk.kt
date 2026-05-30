@@ -3,7 +3,7 @@ package com.nitropush
 import com.margelo.nitro.nitropush.HybridNitroPushClientSpec
 import com.margelo.nitro.nitropush.HybridNitroPushSpec
 import com.margelo.nitro.nitropush.NitroPushConfig
-import com.nitropush.sdk.NlConfig
+import com.nitropush.sdk.NPConfig
 import com.nitropush.sdk.NitroPushSdk
 
 /**
@@ -43,7 +43,7 @@ class HybridNitroPushSdk : HybridNitroPushSpec() {
   }
 }
 
-private fun NitroPushConfig.toPlain() = NlConfig(
+private fun NitroPushConfig.toPlain() = NPConfig(
   serverUrl = serverUrl,
   deploymentKey = deploymentKey,
   storageBaseUrl = storageBaseUrl,

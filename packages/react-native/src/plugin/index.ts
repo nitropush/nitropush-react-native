@@ -7,7 +7,7 @@
  *
  * What it does at `expo prebuild` time:
  *
- *   ▸ AppDelegate.swift       inject `import NitroPushNative`
+ *   ▸ AppDelegate.swift       inject `import NitroPush`
  *                             inject `configure()` + background update-check
  *                             `Task.detached` (when serverUrl + deploymentKey
  *                             are provided as plugin props)
@@ -64,10 +64,13 @@
  */
 
 import {
+    AndroidConfig,
     type ConfigPlugin,
     createRunOncePlugin,
+    withAndroidManifest,
     withAppDelegate,
     withDangerousMod,
+    withInfoPlist,
     withMainApplication,
   } from "@expo/config-plugins";
   import { mergeContents } from "@expo/config-plugins/build/utils/generateCode";
@@ -98,9 +101,27 @@ import {
     deploymentKey?: string;
     /**
      * Object-storage base URL for bundle downloads (e.g. your MinIO / S3
-     * bucket URL). Required when `serverUrl` is set.
+     * bucket URL). Injected into Info.plist / AndroidManifest.
      */
     storageBaseUrl?: string;
+    /**
+     * Base64-encoded DER SPKI public key used to verify bundle signatures.
+     * Injected as `NITROPUSH_BUNDLE_PUBLIC_KEY` in Info.plist / AndroidManifest.
+     * Only required when your releases are signed (`--signing-key` on upload).
+     */
+    bundlePublicKey?: string;
+    /**
+     * Inject a native `configure()` + background update-check `Task.detached`
+     * into `AppDelegate.swift`. Only needed for **bare React Native** apps that
+     * want the SDK initialised before the JS engine starts.
+     *
+     * In **Expo** apps leave this `false` (the default): the JS-side no-arg
+     * `configure()` call reads `NITROPUSH_*` from Info.plist instead, which the
+     * plugin already injects via `withInfoPlist`.
+     *
+     * Default: `false`.
+     */
+    nativeConfigure?: boolean;
   }
   
   const withNitroPush: ConfigPlugin<NitroPushPluginProps | void> = (
@@ -113,8 +134,52 @@ import {
       serverUrl: props?.serverUrl ?? "",
       deploymentKey: props?.deploymentKey ?? "",
       storageBaseUrl: props?.storageBaseUrl ?? "",
+      bundlePublicKey: props?.bundlePublicKey ?? "",
+      nativeConfigure: props?.nativeConfigure ?? false,
     };
-  
+
+    // ── iOS Info.plist keys ────────────────────────────────────────────────
+    // The no-arg `configure()` call reads NITROPUSH_* from Info.plist; inject
+    // them whenever the plugin has values for them.
+    if (opts.ios && opts.deploymentKey) {
+      config = withInfoPlist(config, (cfg) => {
+        cfg.modResults["NITROPUSH_DEPLOYMENT_KEY"] = opts.deploymentKey;
+        if (opts.serverUrl)       cfg.modResults["NITROPUSH_SERVER_URL"]       = opts.serverUrl;
+        if (opts.storageBaseUrl)  cfg.modResults["NITROPUSH_STORAGE_BASE_URL"] = opts.storageBaseUrl;
+        if (opts.bundlePublicKey) cfg.modResults["NITROPUSH_BUNDLE_PUBLIC_KEY"]= opts.bundlePublicKey;
+        return cfg;
+      });
+    }
+
+    // ── Android <meta-data> ───────────────────────────────────────────────
+    // Mirror of the iOS keys; the SDK reads them from AndroidManifest <application>.
+    if (opts.android && opts.deploymentKey) {
+      config = withAndroidManifest(config, (cfg) => {
+        const mainApp = AndroidConfig.Manifest.getMainApplication(cfg.modResults);
+        if (!mainApp) return cfg;
+        const MANAGED_KEYS = [
+          "NITROPUSH_DEPLOYMENT_KEY",
+          "NITROPUSH_SERVER_URL",
+          "NITROPUSH_STORAGE_BASE_URL",
+          "NITROPUSH_BUNDLE_PUBLIC_KEY",
+        ];
+        // Remove stale entries first (idempotent re-runs).
+        mainApp["meta-data"] = (mainApp["meta-data"] ?? []).filter(
+          (m) => !MANAGED_KEYS.includes(m.$["android:name"]),
+        );
+        const entries: [string, string][] = [
+          ["NITROPUSH_DEPLOYMENT_KEY", opts.deploymentKey],
+        ];
+        if (opts.serverUrl)       entries.push(["NITROPUSH_SERVER_URL",        opts.serverUrl]);
+        if (opts.storageBaseUrl)  entries.push(["NITROPUSH_STORAGE_BASE_URL",  opts.storageBaseUrl]);
+        if (opts.bundlePublicKey) entries.push(["NITROPUSH_BUNDLE_PUBLIC_KEY", opts.bundlePublicKey]);
+        for (const [name, value] of entries) {
+          mainApp["meta-data"].push({ $: { "android:name": name, "android:value": value } });
+        }
+        return cfg;
+      });
+    }
+
     if (opts.ios) {
       config = withAppDelegate(config, (cfg) => {
         if (cfg.modResults.language !== "swift") {
@@ -128,6 +193,8 @@ import {
             serverUrl: opts.serverUrl || undefined,
             deploymentKey: opts.deploymentKey || undefined,
             storageBaseUrl: opts.storageBaseUrl || undefined,
+            bundlePublicKey: opts.bundlePublicKey || undefined,
+            nativeConfigure: opts.nativeConfigure,
           },
         );
         return cfg;
@@ -172,13 +239,14 @@ import {
   }; 
   
   // ─── iOS: Podfile post_install umbrella patch ────────────────────────────────
-  
+
   const TAG_IOS_PODFILE_UMBRELLA = "nitropush-ios-podfile-umbrella-patch";
+  const TAG_IOS_PODFILE_NITROMODULES_CXX = "nitropush-ios-podfile-nitromodules-cxx";
   
   /**
    * The Ruby snippet injected into the generated Podfile's post_install block.
    *
-   * It rewrites `Pods/Target Support Files/NitroPushNative/NitroPushNative-umbrella.h`
+   * It rewrites `Pods/Target Support Files/NitroPush/NitroPush-umbrella.h`
    * so the nitrogen-generated C++ `.hpp` `#imports` are wrapped in
    * `#ifdef __cplusplus`. Without this, Xcode 26 validates the umbrella in
    * pure ObjC mode and the `namespace margelo::nitro …` declarations fail
@@ -189,11 +257,61 @@ import {
    *
    * @internal Exported for unit testing.
    */
+  /**
+   * Ruby snippet that forces C++ mode on the NitroModules target so Xcode 26
+   * can find `<functional>`, `<type_traits>`, etc. when validating its public
+   * module headers.  Without this, strict-modular-headers validation runs the
+   * umbrella in ObjC mode and the C++ stdlib `#include`s fail with
+   * "'functional' file not found".
+   *
+   * @internal Exported for unit testing.
+   */
+  export const NITROMODULES_PODFILE_CXX_SNIPPET = [
+    "    # NitroModules + NitroPush — Xcode 26 C++ interop chain fix.",
+    "    # Step 1: C++ build settings on the NitroModules and NitroPush pod targets.",
+    "    installer.pods_project.targets.each do |target|",
+    "      if ['NitroModules', 'NitroPush'].include?(target.name)",
+    "        target.build_configurations.each do |config|",
+    "          config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++20'",
+    "          config.build_settings['SWIFT_OBJC_INTEROP_MODE'] = 'objcxx'",
+    "          config.build_settings['CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES'] = 'YES'",
+    "        end",
+    "      end",
+    "    end",
+    "    # Step 2: The main app target must also opt into C++ interop because",
+    "    #   NitroPush's .swiftmodule is tagged 'built with C++ interop' and Swift",
+    "    #   refuses to import it from a non-C++-interop compilation unit.",
+    "    installer.aggregate_targets.each do |agg|",
+    "      agg.user_project.targets.each do |target|",
+    "        target.build_configurations.each do |config|",
+    "          config.build_settings['SWIFT_OBJC_INTEROP_MODE'] = 'objcxx'",
+    "        end",
+    "      end",
+    "      agg.user_project.save",
+    "    end",
+    "    # Step 3: Umbrella-header patch — wrap .hpp imports in #ifdef __cplusplus so",
+    "    #   ObjC-mode module validation skips C++ stdlib includes.",
+    "    nm_umbrella = File.join(",
+    "      installer.sandbox.root.to_s,",
+    "      'Target Support Files/NitroModules/NitroModules-umbrella.h'",
+    "    )",
+    "    if File.exist?(nm_umbrella)",
+    "      nm_content = File.read(nm_umbrella)",
+    "      nm_hpp = nm_content.scan(/^#import\\s+\"[^\"]+\\.hpp\"\\s*$/).join(\"\\n\")",
+    "      unless nm_hpp.empty? || nm_content.include?('#ifdef __cplusplus')",
+    "        nm_guarded = \"#ifdef __cplusplus\\n#{nm_hpp}\\n#endif\"",
+    "        nm_patched = nm_content.gsub(/^#import\\s+\"[^\"]+\\.hpp\"\\s*\\n/, '')",
+    "                               .sub(/(FOUNDATION_EXPORT double)/, \"#{nm_guarded}\\n\\n\\\\1\")",
+    "        File.write(nm_umbrella, nm_patched)",
+    "      end",
+    "    end",
+  ].join("\n");
+
   export const NITROPUSH_PODFILE_UMBRELLA_SNIPPET = [
-    "    # NitroPushNative — Xcode 26 strict-modular-headers fix.",
+    "    # NitroPush — Xcode 26 strict-modular-headers fix.",
     "    nitropush_umbrella = File.join(",
     "      installer.sandbox.root.to_s,",
-    "      'Target Support Files/NitroPushNative/NitroPushNative-umbrella.h'",
+    "      'Target Support Files/NitroPush/NitroPush-umbrella.h'",
     "    )",
     "    if File.exist?(nitropush_umbrella)",
     "      nitropush_content = File.read(nitropush_umbrella)",
@@ -221,8 +339,8 @@ import {
     // Anchor on the Expo-specific last argument of `react_native_post_install`.
     // The next line is the call's closing `)`, so offset 2 lands AFTER the
     // call ends but still inside the surrounding `post_install do |installer|`
-    // block — exactly where we want the umbrella patch to run.
-    const expoAnchor = mergeContents({
+    // block — exactly where we want both patches to run.
+    const umbrellaExpo = mergeContents({
       src: contents,
       newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
       anchor:
@@ -231,11 +349,24 @@ import {
       tag: TAG_IOS_PODFILE_UMBRELLA,
       comment: "#",
     });
-    if (expoAnchor.didMerge || expoAnchor.didClear) return expoAnchor.contents;
-  
+    const useExpoAnchors = umbrellaExpo.didMerge || umbrellaExpo.didClear;
+    let patched = umbrellaExpo.contents;
+
+    // NitroModules C++ fix — same anchor, injected right after the umbrella block.
+    const cxxExpo = mergeContents({
+      src: patched,
+      newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
+      anchor:
+        /:ccache_enabled\s*=>\s*ccache_enabled\?\(podfile_properties\),?\s*$/m,
+      offset: 2,
+      tag: TAG_IOS_PODFILE_NITROMODULES_CXX,
+      comment: "#",
+    });
+    if (useExpoAnchors || cxxExpo.didMerge || cxxExpo.didClear) return cxxExpo.contents;
+
     // Bare RN template (no Expo ccache helper): anchor on the last common
     // argument of react_native_post_install. Offset 2 lands past the `)`.
-    const rnAnchor = mergeContents({
+    const umbrellaRn = mergeContents({
       src: contents,
       newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
       anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
@@ -243,7 +374,17 @@ import {
       tag: TAG_IOS_PODFILE_UMBRELLA,
       comment: "#",
     });
-    return rnAnchor.contents;
+    patched = umbrellaRn.contents;
+
+    const cxxRn = mergeContents({
+      src: patched,
+      newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
+      anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
+      offset: 2,
+      tag: TAG_IOS_PODFILE_NITROMODULES_CXX,
+      comment: "#",
+    });
+    return cxxRn.contents;
   }
   
   
@@ -257,7 +398,7 @@ import {
   
   /**
    * Patches `AppDelegate.swift` so:
-   *   1. `NitroPushNative` is imported.
+   *   1. `NitroPush` is imported.
    *   2. `configure()` + a background update-check task are injected into
    *      `application(_:didFinishLaunchingWithOptions:)` (only when
    *      serverUrl + deploymentKey are provided).
@@ -273,14 +414,16 @@ import {
       serverUrl?: string;
       deploymentKey?: string;
       storageBaseUrl?: string;
+      bundlePublicKey?: string;
+      nativeConfigure?: boolean;
     } = {},
   ): string {
     let src = contents;
   
-    // 1. import NitroPushNative — after the first import statement.
+    // 1. import NitroPush — after the first import statement.
     src = mergeContents({
       src,
-      newSrc: "import NitroPushNative",
+      newSrc: "import NitroPush",
       anchor: /^import .+$/m,
       offset: 1,
       tag: TAG_IOS_IMPORT,
@@ -288,17 +431,28 @@ import {
     }).contents;
   
     // 2. configure() + background update-check — before the RN factory setup.
-    if (opts.serverUrl && opts.deploymentKey) {
+    // Only injected when nativeConfigure=true (bare-RN pattern).
+    // Expo apps skip this; JS calls the no-arg configure() which reads from Info.plist.
+    if (opts.nativeConfigure && opts.deploymentKey) {
+      // Build NPConfig args — only include URL overrides when non-default.
+      const DEFAULT_SERVER = "https://api.nitropush.org";
+      const DEFAULT_CDN    = "https://cdn.nitropush.org";
+      const configArgs: string[] = [
+        `        deploymentKey:  ${JSON.stringify(opts.deploymentKey)}`,
+      ];
+      if (opts.serverUrl && opts.serverUrl !== DEFAULT_SERVER) {
+        configArgs.push(`        serverUrl:      ${JSON.stringify(opts.serverUrl)}`);
+      }
+      if (opts.storageBaseUrl && opts.storageBaseUrl !== DEFAULT_CDN) {
+        configArgs.push(`        storageBaseUrl: ${JSON.stringify(opts.storageBaseUrl)}`);
+      }
+      if (opts.bundlePublicKey) {
+        configArgs.push(`        bundlePublicKey: ${JSON.stringify(opts.bundlePublicKey)}`);
+      }
       const configLines: string[] = [
         "    do {",
-        "      try NitroPushSdk.shared.configure(NlConfig(",
-        `        serverUrl:      ${JSON.stringify(opts.serverUrl)},`,
-        `        deploymentKey:  ${JSON.stringify(opts.deploymentKey)},`,
-      ];
-      if (opts.storageBaseUrl) {
-        configLines.push(`        storageBaseUrl: ${JSON.stringify(opts.storageBaseUrl)}`);
-      }
-      configLines.push(
+        `      try NitroPushSdk.shared.configure(NPConfig(`,
+        ...configArgs.map((a, i) => a + (i < configArgs.length - 1 ? "," : "")),
         "      ))",
         "    } catch {",
         '      NSLog("[NitroPush] configure failed: %@", "\\(error)")',
@@ -313,7 +467,7 @@ import {
         '        NSLog("[NitroPush] background sync failed: %@", "\\(error)")',
         "      }",
         "    }",
-      );
+      ];
   
       try {
         src = mergeContents({
