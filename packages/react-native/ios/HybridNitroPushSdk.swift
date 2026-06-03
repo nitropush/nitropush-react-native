@@ -47,7 +47,7 @@ private extension NitroPushConfig {
             storageBaseUrl: storageBaseUrl,
             appVersion: appVersion,
             clientUniqueId: clientUniqueId,
-            enableDeltaUpdates: enableDeltaUpdates
+            enableDeltaUpdates: enableDeltaUpdates ?? false
         )
     }
 }
