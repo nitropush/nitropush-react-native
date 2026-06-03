@@ -51,7 +51,7 @@ data class NitroPushConfig(
   }
 
   override fun hashCode(): Int {
-    return arrayOf<Any?>(
+    return arrayOf(
       serverUrl,
       deploymentKey,
       storageBaseUrl,

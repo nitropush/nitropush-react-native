@@ -42,15 +42,12 @@ namespace margelo::nitro::nitropush {
       jni::local_ref<jni::JString> appVersion = this->getFieldValue(fieldAppVersion);
       static const auto fieldClientUniqueId = clazz->getField<jni::JString>("clientUniqueId");
       jni::local_ref<jni::JString> clientUniqueId = this->getFieldValue(fieldClientUniqueId);
-      static const auto fieldEnableDeltaUpdates = clazz->getField<jni::JBoolean>("enableDeltaUpdates");
-      jni::local_ref<jni::JBoolean> enableDeltaUpdates = this->getFieldValue(fieldEnableDeltaUpdates);
       return NitroPushConfig(
         serverUrl->toStdString(),
         deploymentKey->toStdString(),
         storageBaseUrl->toStdString(),
         appVersion != nullptr ? std::make_optional(appVersion->toStdString()) : std::nullopt,
-        clientUniqueId != nullptr ? std::make_optional(clientUniqueId->toStdString()) : std::nullopt,
-        enableDeltaUpdates != nullptr ? std::make_optional(static_cast<bool>(enableDeltaUpdates->value())) : std::nullopt
+        clientUniqueId != nullptr ? std::make_optional(clientUniqueId->toStdString()) : std::nullopt
       );
     }
 
@@ -60,7 +57,7 @@ namespace margelo::nitro::nitropush {
      */
     [[maybe_unused]]
     static jni::local_ref<JNitroPushConfig::javaobject> fromCpp(const NitroPushConfig& value) {
-      using JSignature = JNitroPushConfig(jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JBoolean>);
+      using JSignature = JNitroPushConfig(jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>);
       static const auto clazz = javaClassStatic();
       static const auto create = clazz->getStaticMethod<JSignature>("fromCpp");
       return create(
@@ -69,8 +66,7 @@ namespace margelo::nitro::nitropush {
         jni::make_jstring(value.deploymentKey),
         jni::make_jstring(value.storageBaseUrl),
         value.appVersion.has_value() ? jni::make_jstring(value.appVersion.value()) : nullptr,
-        value.clientUniqueId.has_value() ? jni::make_jstring(value.clientUniqueId.value()) : nullptr,
-        value.enableDeltaUpdates.has_value() ? jni::JBoolean::valueOf(value.enableDeltaUpdates.value()) : nullptr
+        value.clientUniqueId.has_value() ? jni::make_jstring(value.clientUniqueId.value()) : nullptr
       );
     }
   };

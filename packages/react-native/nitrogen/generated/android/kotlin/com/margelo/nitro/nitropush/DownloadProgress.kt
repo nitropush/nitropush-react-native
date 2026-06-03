@@ -35,7 +35,7 @@ data class DownloadProgress(
   }
 
   override fun hashCode(): Int {
-    return arrayOf<Any?>(
+    return arrayOf(
       receivedBytes,
       totalBytes
     ).contentDeepHashCode()

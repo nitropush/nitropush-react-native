@@ -18,7 +18,7 @@ public extension NitroPushConfig {
   /**
    * Create a new instance of `NitroPushConfig`.
    */
-  init(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Bool?) {
+  init(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Bool? = nil) {
     self.init(std.string(serverUrl), std.string(deploymentKey), std.string(storageBaseUrl), { () -> bridge.std__optional_std__string_ in
       if let __unwrappedValue = appVersion {
         return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
@@ -78,13 +78,12 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var enableDeltaUpdates: Bool? {
     return { () -> Bool? in
       if bridge.has_value_std__optional_bool_(self.__enableDeltaUpdates) {
-        let __unwrapped = bridge.get_std__optional_bool_(self.__enableDeltaUpdates)
-        return __unwrapped
+        return bridge.get_std__optional_bool_(self.__enableDeltaUpdates)
       } else {
         return nil
       }
