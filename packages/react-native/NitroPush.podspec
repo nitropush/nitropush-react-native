@@ -23,9 +23,10 @@ Pod::Spec.new do |s|
   ]
 
   # libbz2 is required by bspatch.c (ships on every Apple platform).
-  # Set this BEFORE add_nitrogen_files so the merge in autolinking.rb
-  # preserves it. $(inherited) chains with any flags the build system adds.
-  s.pod_target_xcconfig = { "OTHER_LDFLAGS" => "$(inherited) -lbz2" }
+  # s.libraries propagates -lbz2 to the final app linker invocation —
+  # pod_target_xcconfig alone only affects the pod compilation step and
+  # is ignored when the pod is a static library.
+  s.libraries = 'bz2'
 
   load 'nitrogen/generated/ios/NitroPush+autolinking.rb'
   add_nitrogen_files(s)
