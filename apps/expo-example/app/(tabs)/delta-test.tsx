@@ -8,56 +8,36 @@ import {
   ActivityIndicator,
   Platform,
 } from 'react-native';
-import { configureWith, sync, InstallMode, SyncStatus, type DownloadProgress } from '@nitropush/react-native';
+import {
+  configureWith,
+  sync,
+  InstallMode,
+  SyncStatus,
+  type DownloadProgress,
+} from '@nitropush/react-native';
 
-/**
- * Delta bundle update test screen.
- *
- * Points at the local mock server (scripts/serve-delta-mock.mjs).
- * Run the server first:
- *   node scripts/serve-delta-mock.mjs
- *
- * On a simulator, localhost works directly.
- * On a physical device, replace localhost with your Mac's LAN IP.
- */
+const SERVER_URL      = process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL      ?? '';
+const DEPLOYMENT_KEY  = process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY  ?? '';
+const STORAGE_BASE    = process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL ?? '';
 
-// ─── Change this to your Mac's LAN IP when testing on a physical device ───
-const MOCK_SERVER = __DEV__ ? 'http://localhost:3333' : 'https://api.nitropush.org';
+const BASE_CONFIG = {
+  serverUrl:      SERVER_URL,
+  deploymentKey:  DEPLOYMENT_KEY,
+  storageBaseUrl: STORAGE_BASE,
+};
 
 const SCENARIOS = [
   {
     id: 'delta',
-    label: '✓ Delta path',
-    description: 'enableDeltaUpdates: true\nServer offers delta (hash matches)',
-    config: {
-      serverUrl: MOCK_SERVER,
-      deploymentKey: 'test-key',
-      storageBaseUrl: `${MOCK_SERVER}/storage`,
-      enableDeltaUpdates: true,
-    },
+    label: '✓ Delta updates ON',
+    description: 'enableDeltaUpdates: true\nDownloads patch when server offers one',
+    config: { ...BASE_CONFIG, enableDeltaUpdates: true },
   },
   {
     id: 'full',
-    label: '⬇ Full bundle path',
+    label: '⬇  Delta updates OFF',
     description: 'enableDeltaUpdates: false\nAlways downloads full bundle',
-    config: {
-      serverUrl: MOCK_SERVER,
-      deploymentKey: 'test-key',
-      storageBaseUrl: `${MOCK_SERVER}/storage`,
-      enableDeltaUpdates: false,
-    },
-  },
-  {
-    id: 'corrupt',
-    label: '💥 Corrupt patch → fallback',
-    description: 'Run server with --corrupt-patch\nSDK should fall back to full bundle',
-    config: {
-      serverUrl: MOCK_SERVER,
-      deploymentKey: 'test-key',
-      storageBaseUrl: `${MOCK_SERVER}/storage`,
-      enableDeltaUpdates: true,
-    },
-    serverFlag: '--corrupt-patch',
+    config: { ...BASE_CONFIG, enableDeltaUpdates: false },
   },
 ];
 
@@ -79,11 +59,9 @@ export default function DeltaTestScreen() {
     setBusy(true);
 
     addLog(`Scenario: ${scenario.label}`, 'dim');
-    addLog(`Server: ${scenario.config.serverUrl}`, 'dim');
+    addLog(`Server: ${SERVER_URL}`, 'dim');
+    addLog(`Key: ${DEPLOYMENT_KEY.slice(0, 24)}…`, 'dim');
     addLog(`enableDeltaUpdates: ${scenario.config.enableDeltaUpdates}`, 'dim');
-    if (scenario.serverFlag) {
-      addLog(`⚠  Start server with: node scripts/serve-delta-mock.mjs ${scenario.serverFlag}`, 'dim');
-    }
     addLog('─'.repeat(36), 'dim');
 
     try {
@@ -94,29 +72,28 @@ export default function DeltaTestScreen() {
         { installMode: InstallMode.ON_NEXT_RESTART },
         (s) => {
           const labels: Partial<Record<SyncStatus, string>> = {
-            [SyncStatus.CHECKING_FOR_UPDATE]: '🔍 Checking for update…',
+            [SyncStatus.CHECKING_FOR_UPDATE]: '🔍 Checking…',
             [SyncStatus.DOWNLOADING_PACKAGE]: '⬇  Downloading…',
             [SyncStatus.INSTALLING_UPDATE]:   '📦 Installing…',
             [SyncStatus.UPDATE_INSTALLED]:    '✅ Update installed',
             [SyncStatus.UP_TO_DATE]:          '✓  Already up to date',
             [SyncStatus.UNKNOWN_ERROR]:       '✗  Error',
           };
-          const label = labels[s] ?? `Status(${s})`;
-          addLog(label, s === SyncStatus.UNKNOWN_ERROR ? 'err' : 'info');
+          addLog(labels[s] ?? `Status(${s})`, s === SyncStatus.UNKNOWN_ERROR ? 'err' : 'info');
         },
         (p) => {
           setProgress(p);
           if (p.totalBytes > 0) {
             const pct = Math.round((p.receivedBytes / p.totalBytes) * 100);
-            const kb = (p.receivedBytes / 1024).toFixed(1);
-            const total = (p.totalBytes / 1024).toFixed(1);
-            addLog(`  ${pct}%  ${kb} / ${total} KB`, 'dim');
+            const kb  = (p.receivedBytes / 1024).toFixed(1);
+            const tot = (p.totalBytes   / 1024).toFixed(1);
+            addLog(`  ${pct}%  ${kb} / ${tot} KB`, 'dim');
           }
         },
       );
 
       addLog('─'.repeat(36), 'dim');
-      addLog(`Final status: ${SyncStatus[status] ?? status}`, status === SyncStatus.UNKNOWN_ERROR ? 'err' : 'ok');
+      addLog(`Final: ${SyncStatus[status] ?? status}`, status === SyncStatus.UNKNOWN_ERROR ? 'err' : 'ok');
     } catch (e: any) {
       addLog(`Exception: ${e?.message ?? String(e)}`, 'err');
     } finally {
@@ -127,10 +104,12 @@ export default function DeltaTestScreen() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Text style={styles.title}>Delta Bundle Test</Text>
+      <Text style={styles.title}>Delta Updates — Live Test</Text>
       <Text style={styles.subtitle}>
-        Start the mock server, then tap a scenario:{'\n'}
-        <Text style={styles.code}>node scripts/serve-delta-mock.mjs</Text>
+        {'Tap a scenario to sync against the live server.\n'}
+        <Text style={styles.code}>
+          {SERVER_URL || '(EXPO_PUBLIC_NITROPUSH_SERVER_URL not set)'}
+        </Text>
       </Text>
 
       {SCENARIOS.map((s) => (
@@ -169,16 +148,19 @@ export default function DeltaTestScreen() {
       )}
 
       <View style={styles.infoBox}>
-        <Text style={styles.infoTitle}>What to look for</Text>
+        <Text style={styles.infoTitle}>How to publish a delta release</Text>
         <Text style={styles.infoText}>
-          <Text style={styles.bold}>Delta path:</Text> download size should be{'\n'}
-          much smaller than the full bundle.{'\n\n'}
-          <Text style={styles.bold}>Full bundle path:</Text> download size should{'\n'}
-          be the full bundle size.{'\n\n'}
-          <Text style={styles.bold}>Corrupt patch:</Text> SDK should log a delta{'\n'}
-          failure and fall back to full bundle.{'\n\n'}
-          Server logs (in your terminal) show exactly{'\n'}
-          which endpoints are hit.
+          {'1. Export the app twice (two different builds)\n'}
+          {'2. Run the CLI with --delta:\n\n'}
+          <Text style={styles.code}>
+            {'npx nitropush release upload \\\n'}
+            {'  --project <id> --environment test \\\n'}
+            {'  --label v1.0.1 --bundle-path ./dist \\\n'}
+            {'  --delta\n\n'}
+          </Text>
+          {'3. Check the CLI output for savings %\n'}
+          {'4. Tap "Delta ON" above — download size\n'}
+          {'   should be much smaller than full bundle.'}
         </Text>
       </View>
     </ScrollView>
@@ -187,10 +169,10 @@ export default function DeltaTestScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f0f13' },
-  content: { padding: 20, paddingTop: 60, paddingBottom: 40 },
-  title: { fontSize: 22, fontWeight: '700', color: '#f1f5f9', marginBottom: 4 },
-  subtitle: { fontSize: 13, color: '#94a3b8', marginBottom: 24, lineHeight: 20 },
-  code: { fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }), color: '#a5b4fc' },
+  content:   { padding: 20, paddingTop: 60, paddingBottom: 40 },
+  title:     { fontSize: 22, fontWeight: '700', color: '#f1f5f9', marginBottom: 4 },
+  subtitle:  { fontSize: 13, color: '#94a3b8', marginBottom: 24, lineHeight: 20 },
+  code:      { fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }), color: '#a5b4fc' },
   button: {
     backgroundColor: '#1e1e2e',
     borderRadius: 12,
@@ -200,8 +182,13 @@ const styles = StyleSheet.create({
     borderColor: '#2d2d3f',
   },
   buttonDisabled: { opacity: 0.5 },
-  buttonLabel: { fontSize: 15, fontWeight: '600', color: '#e2e8f0', marginBottom: 4 },
-  buttonDesc: { fontSize: 12, color: '#64748b', lineHeight: 18, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }) },
+  buttonLabel:    { fontSize: 15, fontWeight: '600', color: '#e2e8f0', marginBottom: 4 },
+  buttonDesc: {
+    fontSize: 12,
+    color: '#64748b',
+    lineHeight: 18,
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+  },
   progressRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 },
   progressText: { fontSize: 13, color: '#94a3b8' },
   logBox: {
@@ -226,6 +213,5 @@ const styles = StyleSheet.create({
     borderColor: '#1e1e2e',
   },
   infoTitle: { fontSize: 13, fontWeight: '600', color: '#94a3b8', marginBottom: 8 },
-  infoText: { fontSize: 12, color: '#64748b', lineHeight: 20 },
-  bold: { color: '#94a3b8', fontWeight: '600' },
+  infoText:  { fontSize: 12, color: '#64748b', lineHeight: 20 },
 });
