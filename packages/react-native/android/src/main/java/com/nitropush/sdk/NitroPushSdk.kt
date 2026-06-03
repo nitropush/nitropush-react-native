@@ -159,6 +159,9 @@ class NitroPushSdk private constructor(
     /** Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
      *  signature verification. `null` means verification is skipped. */
     private var bundlePublicKey: String? = null
+    /** Experimental: when true, send currentBundleHash in update checks and
+     *  attempt delta download/patch before falling back to full bundle. */
+    private var enableDeltaUpdates: Boolean = false
 
     private val progressListeners = mutableMapOf<Int, (NPDownloadProgress) -> Unit>()
     private var nextListenerId = 1
@@ -202,6 +205,7 @@ class NitroPushSdk private constructor(
         appVersion = config.appVersion ?: binaryAppVersion()
         clientUniqueId = config.clientUniqueId ?: fallbackDeviceId()
         bundlePublicKey = config.bundlePublicKey
+        enableDeltaUpdates = config.enableDeltaUpdates
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
@@ -588,7 +592,12 @@ class NitroPushSdk private constructor(
         )
         appVersion?.let { params["appVersion"] = it }
         clientUniqueId?.let { params["clientUniqueId"] = it }
-        readActive()?.let { params["currentReleaseId"] = it.releaseId }
+        readActive()?.let { active ->
+            params["currentReleaseId"] = active.releaseId
+            if (enableDeltaUpdates) {
+                active.bundleHash?.let { params["currentBundleHash"] = it }
+            }
+        }
 
         val query = params.entries.joinToString("&") {
             "${Uri.encode(it.key)}=${Uri.encode(it.value)}"
@@ -672,6 +681,13 @@ class NitroPushSdk private constructor(
         // kinds — the distinction lives only at the API/DB layer.
         val bundlePath = downloadManifestRelease(pkg, releaseDir)
 
+        // Compute SHA-256 of the raw bundle for future delta eligibility checks.
+        val bundleHash = runCatching {
+            val bytes = File(bundlePath).readBytes()
+            val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            digest.joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+
         return NPLocalPackage(
             releaseId = pkg.releaseId,
             label = pkg.label,
@@ -687,6 +703,7 @@ class NitroPushSdk private constructor(
             isFailedInstall = false,
             isFirstRun = false,
             bundlePath = bundlePath,
+            bundleHash = bundleHash,
         )
     }
 
@@ -726,9 +743,40 @@ class NitroPushSdk private constructor(
         val bundleOriginalPath = bundleObj.getString("originalPath")
         val bundleSignature = bundleObj.optString("signature").takeIf { it.isNotEmpty() }
         val bundleDest = File(releaseDir, bundleOriginalPath).also { it.parentFile?.mkdirs() }
-        val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
-            ?: resolveObjectUrl(bundleObjectKey)
-        fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest)
+
+        // Experimental delta path: attempt patch application, fall back to full download.
+        val deltaObj = bundleObj.optJSONObject("delta")
+        val activeBundleHash = readActive()?.bundleHash
+        val canUseDelta = enableDeltaUpdates &&
+            deltaObj != null &&
+            activeBundleHash != null &&
+            deltaObj.optString("algorithm") == "bsdiff4" &&
+            activeBundleHash == deltaObj.optString("fromBundleHash")
+
+        var usedDelta = false
+        if (canUseDelta && deltaObj != null) {
+            try {
+                applyDeltaPatch(
+                    patchObjectKey = deltaObj.getString("patchObjectKey"),
+                    patchSha256 = deltaObj.getString("patchSha256"),
+                    patchSize = deltaObj.getInt("patchSize"),
+                    fromBundleHash = deltaObj.getString("fromBundleHash"),
+                    expectedOutputSha256 = bundleSha256,
+                    dest = bundleDest,
+                )
+                usedDelta = true
+                log("downloadManifestRelease → applied delta patch") { deltaObj.getString("patchSha256") }
+            } catch (e: Throwable) {
+                log("downloadManifestRelease → delta failed, falling back") { e.message ?: "unknown error" }
+                bundleDest.delete()
+            }
+        }
+
+        if (!usedDelta) {
+            val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
+                ?: resolveObjectUrl(bundleObjectKey)
+            fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest)
+        }
 
         bundlePublicKey?.let { pubKey ->
             if (bundleSignature == null) {
@@ -782,6 +830,50 @@ class NitroPushSdk private constructor(
         }
         downloadToFile(url, cached, expectedSha256 = sha256, announcedSize = -1)
         cached.copyTo(dest, overwrite = true)
+    }
+
+    /**
+     * Download a bsdiff4 patch, verify its hash, apply it against the cached
+     * base bundle using the JNI bspatch wrapper, verify the output hash, then
+     * write the patched file to [dest].
+     *
+     * Throws on any failure — the caller falls back to full bundle download.
+     */
+    private fun applyDeltaPatch(
+        patchObjectKey: String,
+        patchSha256: String,
+        patchSize: Int,
+        fromBundleHash: String,
+        expectedOutputSha256: String,
+        dest: File,
+    ) {
+        val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
+        val baseCached = File(cache, fromBundleHash)
+        check(baseCached.exists()) { "base bundle not in cache: $fromBundleHash" }
+
+        val patchUrl = resolveObjectUrl(patchObjectKey)
+        val tmpPatch = File.createTempFile("nitropush-patch-", ".bsdiff", applicationContext.cacheDir)
+        try {
+            downloadToFile(patchUrl, tmpPatch, expectedSha256 = patchSha256, announcedSize = patchSize.toLong())
+
+            val rc = BspatchJni.patch(baseCached.absolutePath, tmpPatch.absolutePath, dest.absolutePath)
+            check(rc == 0) { "bspatch failed with code $rc" }
+
+            // Verify output integrity.
+            val actualDigest = java.security.MessageDigest.getInstance("SHA-256").digest(dest.readBytes())
+            val actualSha256 = actualDigest.joinToString("") { "%02x".format(it) }
+            check(actualSha256 == expectedOutputSha256) {
+                "patched bundle hash mismatch (expected $expectedOutputSha256 got $actualSha256)"
+            }
+
+            // Copy verified output into the content-hash cache for future use.
+            val cachedOutput = File(cache, expectedOutputSha256)
+            if (!cachedOutput.exists()) {
+                dest.copyTo(cachedOutput, overwrite = false)
+            }
+        } finally {
+            tmpPatch.delete()
+        }
     }
 
     /** GET → file with optional SHA-256 verification. */
@@ -1007,6 +1099,7 @@ private fun NPLocalPackage.toJson(): JSONObject = JSONObject().apply {
     put("isFirstRun", isFirstRun)
     put("bundlePath", bundlePath)
     description?.let { put("description", it) }
+    bundleHash?.let { put("bundleHash", it) }
 }
 
 private fun NPLocalPackage.Companion.fromJson(obj: JSONObject): NPLocalPackage {
@@ -1030,6 +1123,7 @@ private fun NPLocalPackage.Companion.fromJson(obj: JSONObject): NPLocalPackage {
         isFailedInstall = obj.optBoolean("isFailedInstall", false),
         isFirstRun = obj.optBoolean("isFirstRun", false),
         bundlePath = obj.getString("bundlePath"),
+        bundleHash = obj.optString("bundleHash").takeIf { it.isNotEmpty() },
     )
 }
 

@@ -21,6 +21,11 @@ data class NPConfig(
      * tampered bundles are rejected. `null` (default) skips verification.
      */
     val bundlePublicKey: String? = null,
+    /** Enable experimental delta (bsdiff4) bundle updates. When true, the SDK
+     *  sends `currentBundleHash` with every update check and downloads a patch
+     *  instead of the full bundle when the server offers one. Falls back to full
+     *  bundle on any failure. Default: false. */
+    val enableDeltaUpdates: Boolean = false,
 )
 
 data class NPRemotePackage(
@@ -59,6 +64,9 @@ data class NPLocalPackage(
     val isFailedInstall: Boolean,
     val isFirstRun: Boolean,
     val bundlePath: String,
+    /** SHA-256 of the raw JS bundle file. Sent as `currentBundleHash` in
+     *  update-check requests for delta eligibility checks. */
+    val bundleHash: String? = null,
 ) {
     companion object
 }

@@ -45,10 +45,11 @@ namespace margelo::nitro::nitropush {
     std::string storageBaseUrl     SWIFT_PRIVATE;
     std::optional<std::string> appVersion     SWIFT_PRIVATE;
     std::optional<std::string> clientUniqueId     SWIFT_PRIVATE;
+    std::optional<bool> enableDeltaUpdates     SWIFT_PRIVATE;
 
   public:
     NitroPushConfig() = default;
-    explicit NitroPushConfig(std::string serverUrl, std::string deploymentKey, std::string storageBaseUrl, std::optional<std::string> appVersion, std::optional<std::string> clientUniqueId): serverUrl(serverUrl), deploymentKey(deploymentKey), storageBaseUrl(storageBaseUrl), appVersion(appVersion), clientUniqueId(clientUniqueId) {}
+    explicit NitroPushConfig(std::string serverUrl, std::string deploymentKey, std::string storageBaseUrl, std::optional<std::string> appVersion, std::optional<std::string> clientUniqueId, std::optional<bool> enableDeltaUpdates = std::nullopt): serverUrl(serverUrl), deploymentKey(deploymentKey), storageBaseUrl(storageBaseUrl), appVersion(appVersion), clientUniqueId(clientUniqueId), enableDeltaUpdates(enableDeltaUpdates) {}
 
   public:
     friend bool operator==(const NitroPushConfig& lhs, const NitroPushConfig& rhs) = default;
@@ -68,7 +69,8 @@ namespace margelo::nitro {
         JSIConverter<std::string>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "deploymentKey"))),
         JSIConverter<std::string>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "storageBaseUrl"))),
         JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "appVersion"))),
-        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "clientUniqueId")))
+        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "clientUniqueId"))),
+        JSIConverter<std::optional<bool>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "enableDeltaUpdates")))
       );
     }
     static inline jsi::Value toJSI(jsi::Runtime& runtime, const margelo::nitro::nitropush::NitroPushConfig& arg) {
@@ -78,6 +80,7 @@ namespace margelo::nitro {
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "storageBaseUrl"), JSIConverter<std::string>::toJSI(runtime, arg.storageBaseUrl));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "appVersion"), JSIConverter<std::optional<std::string>>::toJSI(runtime, arg.appVersion));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "clientUniqueId"), JSIConverter<std::optional<std::string>>::toJSI(runtime, arg.clientUniqueId));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "enableDeltaUpdates"), JSIConverter<std::optional<bool>>::toJSI(runtime, arg.enableDeltaUpdates));
       return obj;
     }
     static inline bool canConvert(jsi::Runtime& runtime, const jsi::Value& value) {
@@ -93,6 +96,7 @@ namespace margelo::nitro {
       if (!JSIConverter<std::string>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "storageBaseUrl")))) return false;
       if (!JSIConverter<std::optional<std::string>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "appVersion")))) return false;
       if (!JSIConverter<std::optional<std::string>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "clientUniqueId")))) return false;
+      // enableDeltaUpdates is optional — only validate if present
       return true;
     }
   };

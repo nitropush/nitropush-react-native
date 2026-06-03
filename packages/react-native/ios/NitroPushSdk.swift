@@ -81,6 +81,9 @@ public final class NitroPushSdk {
     /// Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
     /// signature verification. `nil` means verification is skipped.
     private var bundlePublicKey: String?
+    /// Experimental: when true, send currentBundleHash in update checks and
+    /// attempt delta download/patch before falling back to full bundle.
+    private var enableDeltaUpdates: Bool = false
 
     private var progressListeners: [Int: (NPDownloadProgress) -> Void] = [:]
     private var nextListenerId: Int = 1
@@ -147,6 +150,7 @@ public final class NitroPushSdk {
         self.appVersion = config.appVersion ?? Self.binaryAppVersion()
         self.clientUniqueId = config.clientUniqueId ?? Self.fallbackDeviceId()
         self.bundlePublicKey = config.bundlePublicKey
+        self.enableDeltaUpdates = config.enableDeltaUpdates
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
@@ -522,6 +526,9 @@ public final class NitroPushSdk {
         if let id = clientUniqueId { qs.append(URLQueryItem(name: "clientUniqueId", value: id)) }
         if let active = readActive() {
             qs.append(URLQueryItem(name: "currentReleaseId", value: active.releaseId))
+            if enableDeltaUpdates, let bundleHash = active.bundleHash {
+                qs.append(URLQueryItem(name: "currentBundleHash", value: bundleHash))
+            }
         }
         components?.queryItems = qs
         guard let url = components?.url else {
@@ -586,6 +593,13 @@ public final class NitroPushSdk {
         // kinds — the distinction lives only at the API/DB layer.
         let bundlePath = try await downloadManifestRelease(pkg: pkg, releaseDir: dir)
 
+        // Compute SHA-256 of the raw bundle file for future delta eligibility checks.
+        var bundleHash: String? = nil
+        if let bundleData = try? Data(contentsOf: URL(fileURLWithPath: bundlePath)) {
+            bundleHash = CryptoKit.SHA256.hash(data: bundleData)
+                .compactMap { String(format: "%02x", $0) }.joined()
+        }
+
         return NPLocalPackage(
             releaseId: pkg.releaseId,
             label: pkg.label,
@@ -600,7 +614,8 @@ public final class NitroPushSdk {
             isPending: true,
             isFailedInstall: false,
             isFirstRun: false,
-            bundlePath: bundlePath
+            bundlePath: bundlePath,
+            bundleHash: bundleHash
         )
     }
 
@@ -647,13 +662,37 @@ public final class NitroPushSdk {
             at: bundleDest.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let bundleDownloadUrl = manifest.bundle.downloadUrl
-            ?? (try resolveObjectURL(manifest.bundle.objectKey).absoluteString)
-        try await fetchByContentHash(
-            urlString: bundleDownloadUrl,
-            sha256: manifest.bundle.sha256,
-            dest: bundleDest
-        )
+
+        // Experimental delta path: attempt patch application, fall back to full download.
+        var usedDelta = false
+        if enableDeltaUpdates,
+           let delta = manifest.bundle.delta,
+           delta.algorithm == "bsdiff4",
+           let activeBundleHash = readActive()?.bundleHash,
+           activeBundleHash == delta.fromBundleHash {
+            do {
+                try await applyDeltaPatch(
+                    delta: delta,
+                    expectedOutputSha256: manifest.bundle.sha256,
+                    dest: bundleDest
+                )
+                usedDelta = true
+                log("downloadManifestRelease → applied delta patch", delta.patchSha256)
+            } catch {
+                log("downloadManifestRelease → delta failed, falling back to full bundle", error: error)
+                try? FileManager.default.removeItem(at: bundleDest)
+            }
+        }
+
+        if !usedDelta {
+            let bundleDownloadUrl = manifest.bundle.downloadUrl
+                ?? (try resolveObjectURL(manifest.bundle.objectKey).absoluteString)
+            try await fetchByContentHash(
+                urlString: bundleDownloadUrl,
+                sha256: manifest.bundle.sha256,
+                dest: bundleDest
+            )
+        }
 
         if let pubKey = self.bundlePublicKey {
             guard let sig = manifest.bundle.signature else {
@@ -762,6 +801,57 @@ public final class NitroPushSdk {
         }
     }
 
+    /// Download a bsdiff4 patch, verify its hash, apply it against the cached
+    /// base bundle, verify the output hash, then write the patched file to `dest`.
+    private func applyDeltaPatch(
+        delta: SdkManifestBundleDelta,
+        expectedOutputSha256: String,
+        dest: URL
+    ) async throws {
+        // Base bundle must already be in the content-hash cache.
+        let cacheDir = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
+        let basePath = cacheDir.appendingPathComponent(delta.fromBundleHash).path
+        guard FileManager.default.fileExists(atPath: basePath) else {
+            throw NitroPushError.integrityFailure("base bundle not in cache: \(delta.fromBundleHash)")
+        }
+
+        // Download the patch file to a temp location.
+        let patchUrl = try resolveObjectURL(delta.patchObjectKey)
+        let tmpPatch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nitropush-patch-\(delta.patchSha256).bsdiff")
+        defer { try? FileManager.default.removeItem(at: tmpPatch) }
+
+        try await downloadToFile(url: patchUrl, dest: tmpPatch, expectedSha256: delta.patchSha256, announcedSize: delta.patchSize)
+
+        // Apply bsdiff4 patch via the vendored bspatch C function.
+        let outputPath = dest.path
+        let rc = bspatch_apply(basePath, tmpPatch.path, outputPath)
+        guard rc == 0 else {
+            throw NitroPushError.integrityFailure("bspatch failed with code \(rc)")
+        }
+
+        // Verify the patched output matches the new bundle hash.
+        let actualSha256 = try Self.sha256Hex(of: dest)
+        guard actualSha256.lowercased() == expectedOutputSha256.lowercased() else {
+            try? FileManager.default.removeItem(at: dest)
+            throw NitroPushError.integrityFailure(
+                "patched bundle hash mismatch (expected \(expectedOutputSha256) got \(actualSha256))"
+            )
+        }
+
+        // Hermes magic-byte sanity check.
+        guard isHermesBundle(at: dest.path) else {
+            try? FileManager.default.removeItem(at: dest)
+            throw NitroPushError.integrityFailure("patched file is not a valid Hermes bundle")
+        }
+
+        // Copy the verified patched bundle into the content-hash cache for future use.
+        let cachedOutput = cacheDir.appendingPathComponent(expectedOutputSha256)
+        if !FileManager.default.fileExists(atPath: cachedOutput.path) {
+            try? FileManager.default.copyItem(at: dest, to: cachedOutput)
+        }
+    }
+
 }
 
 // MARK: - Wire types for the SDK release manifest
@@ -776,6 +866,14 @@ private struct SdkManifest: Decodable {
     let assets: [SdkManifestAsset]
 }
 
+private struct SdkManifestBundleDelta: Decodable {
+    let fromBundleHash: String
+    let patchObjectKey: String
+    let patchSize: Int
+    let patchSha256: String
+    let algorithm: String
+}
+
 private struct SdkManifestBundle: Decodable {
     let originalPath: String
     let sha256: String
@@ -786,6 +884,8 @@ private struct SdkManifestBundle: Decodable {
     /// Base64 DER ECDSA P-256 signature over `"bundle:<sha256>"`.
     /// Present only when the release was created with a signing key.
     let signature: String?
+    /// Experimental: bsdiff4 patch against a previous bundle.
+    let delta: SdkManifestBundleDelta?
 }
 
 private struct SdkManifestAsset: Decodable {
@@ -1046,6 +1146,7 @@ extension NPLocalPackage {
         if let otaVersion = otaVersion { dict["otaVersion"] = otaVersion }
         if let displayVersion = displayVersion { dict["displayVersion"] = displayVersion }
         if let platforms = platforms { dict["platforms"] = platforms }
+        if let bundleHash = bundleHash { dict["bundleHash"] = bundleHash }
         return dict
     }
 
@@ -1071,7 +1172,8 @@ extension NPLocalPackage {
             isPending: (dict["isPending"] as? Bool) ?? false,
             isFailedInstall: (dict["isFailedInstall"] as? Bool) ?? false,
             isFirstRun: (dict["isFirstRun"] as? Bool) ?? false,
-            bundlePath: bundlePath
+            bundlePath: bundlePath,
+            bundleHash: dict["bundleHash"] as? String
         )
     }
 }

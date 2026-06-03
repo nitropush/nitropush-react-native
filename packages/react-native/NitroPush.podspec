@@ -20,7 +20,12 @@ Pod::Spec.new do |s|
     "ios/**/*.{m,mm}",
     # Implementation (C++ objects)
     "cpp/**/*.{hpp,cpp}",
+    # Vendored bspatch C implementation (experimental delta updates)
+    "ios/bspatch/*.{c,h}",
   ]
+
+  # Link libbz2 for bspatch (ships on every Apple platform)
+  s.pod_target_xcconfig = { "OTHER_LDFLAGS" => "-lbz2" }
 
   load 'nitrogen/generated/ios/NitroPush+autolinking.rb'
   add_nitrogen_files(s)
