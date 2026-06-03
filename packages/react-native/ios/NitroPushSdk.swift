@@ -685,8 +685,12 @@ public final class NitroPushSdk {
         }
 
         if !usedDelta {
-            let bundleDownloadUrl = manifest.bundle.downloadUrl
-                ?? (try resolveObjectURL(manifest.bundle.objectKey).absoluteString)
+            let bundleDownloadUrl: String
+            if let url = manifest.bundle.downloadUrl {
+                bundleDownloadUrl = url
+            } else {
+                bundleDownloadUrl = try resolveObjectURL(manifest.bundle.objectKey).absoluteString
+            }
             try await fetchByContentHash(
                 urlString: bundleDownloadUrl,
                 sha256: manifest.bundle.sha256,
@@ -720,8 +724,12 @@ public final class NitroPushSdk {
                 at: dest.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let assetDownloadUrl = asset.downloadUrl
-                ?? (try resolveObjectURL(asset.objectKey).absoluteString)
+            let assetDownloadUrl: String
+            if let url = asset.downloadUrl {
+                assetDownloadUrl = url
+            } else {
+                assetDownloadUrl = try resolveObjectURL(asset.objectKey).absoluteString
+            }
             try await fetchByContentHash(
                 urlString: assetDownloadUrl,
                 sha256: asset.sha256,
@@ -823,9 +831,8 @@ public final class NitroPushSdk {
 
         try await downloadToFile(url: patchUrl, dest: tmpPatch, expectedSha256: delta.patchSha256, announcedSize: delta.patchSize)
 
-        // Apply bsdiff4 patch via the vendored bspatch C function.
-        let outputPath = dest.path
-        let rc = bspatch_apply(basePath, tmpPatch.path, outputPath)
+        // Apply bsdiff4 patch via the ObjC-wrapped bspatch C function.
+        let rc = NitroPushBspatch.apply(withBasePath: basePath, patchPath: tmpPatch.path, outPath: dest.path)
         guard rc == 0 else {
             throw NitroPushError.integrityFailure("bspatch failed with code \(rc)")
         }
@@ -999,8 +1006,8 @@ extension NitroPushSdk {
             )
         }
         return NPConfig(
-            serverUrl: read("NITROPUSH_SERVER_URL") ?? "https://api.nitropush.org",
             deploymentKey: deploymentKey,
+            serverUrl: read("NITROPUSH_SERVER_URL") ?? "https://api.nitropush.org",
             storageBaseUrl: read("NITROPUSH_STORAGE_BASE_URL") ?? "https://cdn.nitropush.org",
             appVersion: read("NITROPUSH_APP_VERSION"),
             clientUniqueId: read("NITROPUSH_CLIENT_UNIQUE_ID"),
