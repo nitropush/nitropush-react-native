@@ -42,8 +42,8 @@ class HybridNitroPushSdk: HybridNitroPushSpec {
 private extension NitroPushConfig {
     func toPlain() -> NPConfig {
         NPConfig(
-            serverUrl: serverUrl,
             deploymentKey: deploymentKey,
+            serverUrl: serverUrl,
             storageBaseUrl: storageBaseUrl,
             appVersion: appVersion,
             clientUniqueId: clientUniqueId,

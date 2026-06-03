@@ -831,8 +831,15 @@ public final class NitroPushSdk {
 
         try await downloadToFile(url: patchUrl, dest: tmpPatch, expectedSha256: delta.patchSha256, announcedSize: delta.patchSize)
 
-        // Apply bsdiff4 patch via the ObjC-wrapped bspatch C function.
-        let rc = NitroPushBspatch.apply(withBasePath: basePath, patchPath: tmpPatch.path, outPath: dest.path)
+        // Apply bsdiff4 patch. _bspatch_apply is declared in BspatchBridge.swift
+        // via @_silgen_name, which links directly to the C symbol in bspatch.c.
+        let rc = basePath.withCString { base in
+            tmpPatch.path.withCString { patch in
+                dest.path.withCString { out in
+                    _bspatch_apply(base, patch, out)
+                }
+            }
+        }
         guard rc == 0 else {
             throw NitroPushError.integrityFailure("bspatch failed with code \(rc)")
         }
