@@ -35,7 +35,7 @@ data class NitroPushConfig(
   val clientUniqueId: String?,
   @DoNotStrip
   @Keep
-  val enableDeltaUpdates: Boolean?
+  val enableDeltaUpdates: Boolean = false
 ) {
   /* primary constructor */
 
@@ -47,7 +47,7 @@ data class NitroPushConfig(
       && Objects.deepEquals(this.storageBaseUrl, other.storageBaseUrl)
       && Objects.deepEquals(this.appVersion, other.appVersion)
       && Objects.deepEquals(this.clientUniqueId, other.clientUniqueId)
-      && Objects.deepEquals(this.enableDeltaUpdates, other.enableDeltaUpdates)
+      && this.enableDeltaUpdates == other.enableDeltaUpdates
   }
 
   override fun hashCode(): Int {
@@ -69,7 +69,7 @@ data class NitroPushConfig(
     @Keep
     @Suppress("unused")
     @JvmStatic
-    private fun fromCpp(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Boolean?): NitroPushConfig {
+    private fun fromCpp(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Boolean): NitroPushConfig {
       return NitroPushConfig(serverUrl, deploymentKey, storageBaseUrl, appVersion, clientUniqueId, enableDeltaUpdates)
     }
   }
