@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
   Platform,
 } from 'react-native';
-import { configureWith, sync, InstallMode, type SyncStatus, type DownloadProgress } from '@nitropush/react-native';
+import { configureWith, sync, InstallMode, SyncStatus, type DownloadProgress } from '@nitropush/react-native';
 
 /**
  * Delta bundle update test screen.
@@ -94,15 +94,15 @@ export default function DeltaTestScreen() {
         { installMode: InstallMode.ON_NEXT_RESTART },
         (s) => {
           const labels: Partial<Record<SyncStatus, string>> = {
-            CHECKING_FOR_UPDATE: '🔍 Checking for update…',
-            DOWNLOADING_PACKAGE: '⬇  Downloading…',
-            INSTALLING_UPDATE:   '📦 Installing…',
-            UPDATE_INSTALLED:    '✅ Update installed',
-            UP_TO_DATE:          '✓  Already up to date',
-            UNKNOWN_ERROR:       '✗  Error',
+            [SyncStatus.CHECKING_FOR_UPDATE]: '🔍 Checking for update…',
+            [SyncStatus.DOWNLOADING_PACKAGE]: '⬇  Downloading…',
+            [SyncStatus.INSTALLING_UPDATE]:   '📦 Installing…',
+            [SyncStatus.UPDATE_INSTALLED]:    '✅ Update installed',
+            [SyncStatus.UP_TO_DATE]:          '✓  Already up to date',
+            [SyncStatus.UNKNOWN_ERROR]:       '✗  Error',
           };
-          const label = labels[s as keyof typeof labels] ?? String(s);
-          addLog(label, s === 'UNKNOWN_ERROR' ? 'err' : 'info');
+          const label = labels[s] ?? `Status(${s})`;
+          addLog(label, s === SyncStatus.UNKNOWN_ERROR ? 'err' : 'info');
         },
         (p) => {
           setProgress(p);
@@ -116,7 +116,7 @@ export default function DeltaTestScreen() {
       );
 
       addLog('─'.repeat(36), 'dim');
-      addLog(`Final status: ${status}`, status.includes('ERROR') ? 'err' : 'ok');
+      addLog(`Final status: ${SyncStatus[status] ?? status}`, status === SyncStatus.UNKNOWN_ERROR ? 'err' : 'ok');
     } catch (e: any) {
       addLog(`Exception: ${e?.message ?? String(e)}`, 'err');
     } finally {
