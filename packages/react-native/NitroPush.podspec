@@ -14,18 +14,18 @@ Pod::Spec.new do |s|
   s.source       = { :git => "https://github.com/nitropush/nitropush.git", :tag => "#{s.version}" }
 
   s.source_files = [
-    # Implementation (Swift)
-    "ios/**/*.{swift}",
-    # Autolinking / registration (Objective-C++)
-    "ios/**/*.{m,mm}",
+    # Implementation (Swift + Objective-C++)
+    "ios/**/*.{swift,m,mm}",
+    # Vendored bspatch C implementation (experimental delta updates)
+    "ios/**/*.{c,h}",
     # Implementation (C++ objects)
     "cpp/**/*.{hpp,cpp}",
-    # Vendored bspatch C implementation (experimental delta updates)
-    "ios/bspatch/*.{c,h}",
   ]
 
-  # Link libbz2 for bspatch (ships on every Apple platform)
-  s.pod_target_xcconfig = { "OTHER_LDFLAGS" => "-lbz2" }
+  # libbz2 is required by bspatch.c (ships on every Apple platform).
+  # Set this BEFORE add_nitrogen_files so the merge in autolinking.rb
+  # preserves it. $(inherited) chains with any flags the build system adds.
+  s.pod_target_xcconfig = { "OTHER_LDFLAGS" => "$(inherited) -lbz2" }
 
   load 'nitrogen/generated/ios/NitroPush+autolinking.rb'
   add_nitrogen_files(s)
