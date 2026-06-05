@@ -435,6 +435,7 @@ class NitroPushSdk private constructor(
         releaseId: String? = null,
         appVersion: String? = null,
         otaVersion: Double? = null,
+        metadata: JSONObject? = null,
     ) {
         val a = analytics ?: return
         a.enqueue(
@@ -448,8 +449,18 @@ class NitroPushSdk private constructor(
                 osVersion = NPAnalyticsContext.osVersion(),
                 deviceModel = NPAnalyticsContext.deviceModel(),
                 occurredAt = NPAnalyticsContext.now(),
+                metadata = metadata,
             )
         )
+    }
+
+    private fun classifyDeltaError(e: Throwable): String {
+        val msg = e.message?.lowercase() ?: ""
+        return when {
+            msg.contains("hash") || msg.contains("sha") || msg.contains("integrity") -> "hash_mismatch"
+            msg.contains("bspatch") || msg.contains("patch") -> "bspatch_error"
+            else -> "patch_download_failed"
+        }
     }
 
     /**
@@ -766,8 +777,28 @@ class NitroPushSdk private constructor(
                 )
                 usedDelta = true
                 log("downloadManifestRelease → applied delta patch") { deltaObj.getString("patchSha256") }
+                val patchSize = deltaObj.getInt("patchSize")
+                val fullSize = pkg.packageSize.toInt()
+                emit(
+                    type = "download_delta_applied",
+                    releaseId = pkg.releaseId,
+                    appVersion = pkg.appVersion,
+                    otaVersion = pkg.otaVersion,
+                    metadata = JSONObject().apply {
+                        put("patchSizeBytes", patchSize)
+                        put("fullSizeBytes", fullSize)
+                        put("savedBytes", maxOf(0, fullSize - patchSize))
+                    },
+                )
             } catch (e: Throwable) {
                 log("downloadManifestRelease → delta failed, falling back") { e.message ?: "unknown error" }
+                emit(
+                    type = "download_delta_failed",
+                    releaseId = pkg.releaseId,
+                    appVersion = pkg.appVersion,
+                    otaVersion = pkg.otaVersion,
+                    metadata = JSONObject().apply { put("reason", classifyDeltaError(e)) },
+                )
                 bundleDest.delete()
             }
         }

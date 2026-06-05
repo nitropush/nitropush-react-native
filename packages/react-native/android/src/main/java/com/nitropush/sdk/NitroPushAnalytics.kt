@@ -30,6 +30,8 @@ internal data class NPAnalyticsEvent(
     val osVersion: String?,
     val deviceModel: String?,
     val occurredAt: String,
+    /** Free-form metadata for events that need extra context (e.g. delta stats). */
+    val metadata: JSONObject? = null,
 )
 
 /**
@@ -179,6 +181,7 @@ private fun NPAnalyticsEvent.toJson(): JSONObject {
     if (releaseId != null) obj.put("releaseId", releaseId)
     if (osVersion != null) obj.put("osVersion", osVersion)
     if (deviceModel != null) obj.put("deviceModel", deviceModel)
+    if (metadata != null) obj.put("metadata", metadata)
     return obj
 }
 

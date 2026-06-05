@@ -1,6 +1,24 @@
 import Foundation
 import UIKit
 
+/// Free-form metadata attached to events that need extra context (e.g. delta
+/// download stats). All fields are optional so the struct is reusable across
+/// event types without carrying zero-value noise.
+struct NlEventMetadata: Codable {
+    /// For `download_delta_applied` — size of the downloaded patch in bytes.
+    var patchSizeBytes: Int?
+    /// For `download_delta_applied` — size of the full bundle (for comparison).
+    var fullSizeBytes: Int?
+    /// For `download_delta_applied` — bytes saved vs a full download.
+    var savedBytes: Int?
+    /// For `download_delta_failed` — short machine-readable failure reason.
+    var reason: String?
+
+    var isEmpty: Bool {
+        patchSizeBytes == nil && fullSizeBytes == nil && savedBytes == nil && reason == nil
+    }
+}
+
 /// One JS-shaped analytics event. Wire matches the existing `/api/sdk/events`
 /// contract — moving from JS to native must not change the server schema.
 struct NlAnalyticsEvent: Codable {
@@ -13,6 +31,7 @@ struct NlAnalyticsEvent: Codable {
     let osVersion: String?
     let deviceModel: String?
     let occurredAt: String
+    let metadata: NlEventMetadata?
 }
 
 /// Native equivalent of the deleted JS `createAnalyticsEmitter`. Owns the

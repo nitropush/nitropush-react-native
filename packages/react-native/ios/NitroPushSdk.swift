@@ -378,7 +378,8 @@ public final class NitroPushSdk {
         type: String,
         releaseId: String? = nil,
         appVersion: String? = nil,
-        otaVersion: Double? = nil
+        otaVersion: Double? = nil,
+        metadata: NlEventMetadata? = nil
     ) {
         guard let a = analytics else { return }
         let event = NlAnalyticsEvent(
@@ -390,7 +391,8 @@ public final class NitroPushSdk {
             platform: "ios",
             osVersion: NlAnalyticsContext.osVersion(),
             deviceModel: NlAnalyticsContext.deviceModel(),
-            occurredAt: NlAnalyticsContext.now()
+            occurredAt: NlAnalyticsContext.now(),
+            metadata: metadata?.isEmpty == false ? metadata : nil
         )
         a.enqueue(event)
     }
@@ -678,8 +680,27 @@ public final class NitroPushSdk {
                 )
                 usedDelta = true
                 log("downloadManifestRelease → applied delta patch", delta.patchSha256)
+                let fullSize = Int(pkg.packageSize)
+                emit(
+                    type: "download_delta_applied",
+                    releaseId: pkg.releaseId,
+                    appVersion: pkg.appVersion,
+                    otaVersion: pkg.otaVersion,
+                    metadata: NlEventMetadata(
+                        patchSizeBytes: delta.patchSize,
+                        fullSizeBytes: fullSize,
+                        savedBytes: max(0, fullSize - delta.patchSize)
+                    )
+                )
             } catch {
                 log("downloadManifestRelease → delta failed, falling back to full bundle", error: error)
+                emit(
+                    type: "download_delta_failed",
+                    releaseId: pkg.releaseId,
+                    appVersion: pkg.appVersion,
+                    otaVersion: pkg.otaVersion,
+                    metadata: NlEventMetadata(reason: classifyDeltaError(error))
+                )
                 try? FileManager.default.removeItem(at: bundleDest)
             }
         }
@@ -811,6 +832,17 @@ public final class NitroPushSdk {
 
     /// Download a bsdiff4 patch, verify its hash, apply it against the cached
     /// base bundle, verify the output hash, then write the patched file to `dest`.
+    private func classifyDeltaError(_ error: Error) -> String {
+        let msg = error.localizedDescription.lowercased()
+        if msg.contains("hash") || msg.contains("sha") || msg.contains("integrity") {
+            return "hash_mismatch"
+        }
+        if msg.contains("bspatch") || msg.contains("patch") {
+            return "bspatch_error"
+        }
+        return "patch_download_failed"
+    }
+
     private func applyDeltaPatch(
         delta: SdkManifestBundleDelta,
         expectedOutputSha256: String,
