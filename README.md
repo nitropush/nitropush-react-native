@@ -4,9 +4,9 @@
 
 # @nitropush/react-native
 
-**Native-first OTA updates for React Native, built on Nitro Modules.**
+**Native-first OTA updates for React Native and Expo, built on Nitro Modules.**
 
-[Website](https://nitropush.org) · [Docs](https://nitropush.org/docs) · [npm](https://www.npmjs.com/package/@nitropush/react-native)
+[Website](https://nitropush.org) · [Docs](https://docs.nitropush.org) · [npm](https://www.npmjs.com/package/@nitropush/react-native)
 
 </div>
 
@@ -16,80 +16,303 @@
 
 ```
 packages/react-native/        # the SDK (published as @nitropush/react-native on npm)
-apps/expo-example/         # reference Expo app
-apps/react-native-example/ # reference bare React Native app
+apps/expo-example/            # reference Expo app
+apps/react-native-example/    # reference bare React Native app
 ```
 
-This is a Yarn workspaces monorepo. Cloning it gives you a working dev environment for both the SDK and the example apps with hot-reload across the boundary.
+Yarn workspaces monorepo. Cloning gives you a dev environment with hot-reload across the SDK and example apps.
+
+---
 
 ## Install (in your app)
 
 ```sh
+npm install @nitropush/react-native react-native-nitro-modules
+# or
 yarn add @nitropush/react-native react-native-nitro-modules
 ```
 
-Then for Expo, add the config plugin to your `app.json`:
+Then run `pod install` for iOS:
 
-```json
-{
-  "expo": {
-    "plugins": [["@nitropush/react-native", { "ios": true, "android": true }]]
+```sh
+cd ios && pod install
+```
+
+---
+
+## Native setup
+
+### Android — `MainApplication.kt`
+
+```kotlin
+import com.nitropush.sdk.NitroPushSdk
+
+class MainApplication : Application(), ReactApplication {
+  override fun onCreate() {
+    NitroPushSdk.install(this)   // must be first
+    super.onCreate()
   }
 }
 ```
 
-For bare React Native, see the wiring in [`apps/react-native-example/`](apps/react-native-example/) — `AppDelegate.swift` and `MainApplication.kt`.
+Add your deployment key to `AndroidManifest.xml` inside `<application>`:
 
-## Quick start (in this repo)
+```xml
+<!-- Required -->
+<meta-data android:name="NITROPUSH_DEPLOYMENT_KEY"
+           android:value="YOUR_DEPLOYMENT_KEY" />
+
+<!-- Optional — defaults shown -->
+<meta-data android:name="NITROPUSH_SERVER_URL"
+           android:value="https://api.nitropush.org" />
+<meta-data android:name="NITROPUSH_STORAGE_BASE_URL"
+           android:value="https://cdn.nitropush.org" />
+```
+
+### iOS — `AppDelegate.swift`
+
+```swift
+import NitroPushNative
+
+@UIApplicationMain
+class AppDelegate: RCTAppDelegate {
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    NitroPushSdk.install(self)   // must be before super
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+}
+```
+
+Add your deployment key to `Info.plist`:
+
+```xml
+<!-- Required -->
+<key>NITROPUSH_DEPLOYMENT_KEY</key>
+<string>YOUR_DEPLOYMENT_KEY</string>
+
+<!-- Optional — defaults shown -->
+<key>NITROPUSH_SERVER_URL</key>
+<string>https://api.nitropush.org</string>
+
+<key>NITROPUSH_STORAGE_BASE_URL</key>
+<string>https://cdn.nitropush.org</string>
+```
+
+→ [Full native setup guide](https://docs.nitropush.org/native-setup)
+
+---
+
+## Quick start
+
+```ts
+import { configure, sync, InstallMode, SyncStatus } from "@nitropush/react-native";
+import { useEffect } from "react";
+
+// Reads NITROPUSH_DEPLOYMENT_KEY (and optional overrides) from
+// Info.plist on iOS or AndroidManifest meta-data on Android.
+const client = configure();
+
+export default function App() {
+  useEffect(() => {
+    client.notifyAppReady();
+    sync(client, { installMode: InstallMode.ON_NEXT_RESUME }, (status) => {
+      if (status === SyncStatus.UPDATE_INSTALLED) {
+        console.log("Update installed — will apply on next resume");
+      }
+    });
+  }, []);
+
+  // ...
+}
+```
+
+→ [Getting started](https://docs.nitropush.org/getting-started)
+
+---
+
+## Explicit JS config
+
+Use `configureWith` to override the native config at runtime (e.g. a staging server in a debug build):
+
+```ts
+import { configureWith } from "@nitropush/react-native";
+
+const client = configureWith({
+  serverUrl: "https://api.nitropush.org",
+  deploymentKey: "YOUR_DEPLOYMENT_KEY",
+  storageBaseUrl: "https://cdn.nitropush.org",
+});
+```
+
+---
+
+## Low-level API
+
+```ts
+const remote = await client.checkForUpdate();
+
+if (remote) {
+  const local = await remote.download((progress) => {
+    console.log(`${progress.receivedBytes} / ${progress.totalBytes} bytes`);
+  });
+  await local.install(InstallMode.ON_NEXT_RESTART, 0);
+}
+```
+
+→ [SDK API reference](https://docs.nitropush.org/sdk)
+
+---
+
+## Key exports
+
+| Export | Description |
+|--------|-------------|
+| `configure()` | Create a client — reads config from Info.plist / AndroidManifest |
+| `configureWith(config)` | Create a client with explicit JS-side config |
+| `sync(client, options?, callback?)` | High-level check → download → install in one call |
+| `InstallMode` | `IMMEDIATE` · `ON_NEXT_RESTART` · `ON_NEXT_RESUME` · `ON_NEXT_SUSPEND` |
+| `SyncStatus` | `CHECKING_FOR_UPDATE` · `DOWNLOADING_PACKAGE` · `UPDATE_INSTALLED` · … |
+| `NitroPushConfig` | Config shape for `configureWith` |
+| `SyncOptions` | Options for `sync()` (install mode, dialogs, rollback, …) |
+
+→ [Full API reference](https://docs.nitropush.org/sdk)
+
+---
+
+## Delta bundle updates (experimental)
+
+Delta updates send only the bytes that changed between the previous bundle and the new one — a bsdiff4 binary patch instead of the full bundle. A typical JS-only change compresses to 5–15% of the full bundle size.
+
+### How it works end-to-end
+
+```
+  RELEASE TIME (CLI --delta)               UPDATE TIME (SDK enableDeltaUpdates)
+  ──────────────────────────               ────────────────────────────────────
+  Previous bundle A                        Device has bundle A cached
+       │                                        │
+       │  bsdiff A B → patch.bsdiff             │  update check sends
+       ▼                                        │  ?currentBundleHash=<sha256-A>
+  New bundle B + patch ─── upload ─────────────│
+                                                ▼
+  manifest.json stored:               server returns manifest:
+  {                                   {
+    bundle: {                           bundle: {
+      sha256: "<sha256-B>",               sha256: "<sha256-B>",
+      objectKey: "bundles/B.hbc",        objectKey: "bundles/B.hbc",
+      delta: {                           delta: {
+        fromBundleHash: "<sha256-A>",      fromBundleHash: "<sha256-A>",
+        patchObjectKey: "deltas/A-B…",     patchObjectKey: "deltas/A-B…",
+        patchSha256: "<sha256-patch>",     patchSha256: "<sha256-patch>",
+        patchSize: 42100,                  patchSize: 42100,
+        algorithm: "bsdiff4"               algorithm: "bsdiff4"
+      }                                  }
+    }                                  }
+  }                                  }
+                                               │
+                                       ┌───────▼────────┐
+                                       │ eligible?      │
+                                       │ • delta exists │
+                                       │ • algo=bsdiff4 │
+                                       │ • hash matches │
+                                       └───────┬────────┘
+                                         yes   │   no
+                                   ┌───────────┴───────────┐
+                                   ▼                        ▼
+                            download patch           download full
+                            verify sha256             bundle B
+                            bspatch(A, patch) → B
+                            verify output sha256
+                            ✓ install / ✗ fallback
+```
+
+The SDK **always falls back** to the full bundle if the patch fails for any reason — hash mismatch, corrupt file, or bspatch error. Devices that don't have bundle A cached also get the full bundle automatically.
+
+### Enable on the CLI
+
+Install `bsdiff` and pass `--delta` at upload time:
+
+```bash
+# macOS
+brew install bsdiff
+# Debian / Ubuntu
+apt install bsdiff
+
+nitropush release upload \
+  --project <projectId> \
+  --environment prod \
+  --app-version 1.0.0 \
+  --label 1.0.6 \
+  --bundle-path ./dist-ios \
+  --delta
+```
+
+The CLI fetches the previous release bundle, computes the binary diff, and uploads the patch alongside the full bundle. The patch is silently skipped if it is larger than 80% of the full bundle (not worth it).
+
+### Enable on the SDK
+
+```ts
+// Opt in via native config (recommended):
+// iOS Info.plist:
+//   <key>NITROPUSH_ENABLE_DELTA_UPDATES</key><true/>
+// Android AndroidManifest.xml:
+//   <meta-data android:name="NITROPUSH_ENABLE_DELTA_UPDATES" android:value="true" />
+
+// Or at runtime:
+const client = configureWith({
+  serverUrl: "https://api.nitropush.org",
+  deploymentKey: "YOUR_DEPLOYMENT_KEY",
+  storageBaseUrl: "https://cdn.nitropush.org",
+  enableDeltaUpdates: true,
+});
+```
+
+When enabled, the SDK adds `?currentBundleHash=<sha256>` to every update check request. The server attaches a `delta` block to the manifest if a patch for that base hash exists. The SDK downloads the patch, applies `bspatch` natively (Swift/Kotlin), verifies the output hash, and installs — or falls back to the full bundle transparently.
+
+> **Both sides must opt in.** The CLI `--delta` flag generates and stores the patch. The SDK `enableDeltaUpdates` flag downloads and applies it. Either side alone does nothing.
+
+→ [Delta updates docs](https://docs.nitropush.org/delta-updates)
+
+---
+
+## Run the examples (this repo)
 
 ```sh
 git clone https://github.com/nitropush/nitro-sdk.git
 cd nitro-sdk
-corepack enable                  # picks up Yarn 4 from packageManager
+corepack enable
 yarn install
+
+# Expo example
 yarn workspace @nitropush/expo-example start
-```
 
-Or for the bare RN example:
-
-```sh
+# Bare RN example
 yarn workspace @nitropush/react-native-example ios
 yarn workspace @nitropush/react-native-example android
 ```
 
-## Public API
-
-```ts
-import {
-  configure,
-  sync,
-  notifyAppReady,
-  InstallMode,
-  SyncStatus,
-} from "@nitropush/react-native";
-
-configure({
-  serverUrl: process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL!,
-  deploymentKey: process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY!,
-  storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL!,
-});
-
-// In a useEffect, after first successful render:
-await notifyAppReady();
-
-// To check + apply updates:
-await sync(
-  { installMode: InstallMode.ON_NEXT_RESUME },
-  (status) => console.log(SyncStatus[status]),
-  (progress) => console.log(progress),
-);
-```
-
-See [`packages/react-native/src/index.ts`](packages/react-native/src/index.ts) for the full surface.
+---
 
 ## Why native-first?
 
-Telemetry, downloads, install gating, and rollback all fire from Swift/Kotlin — not JS. That means we still see install failures even when the JS engine never boots (cold-start rollbacks, post-install crashes). A JS-only emitter would silently miss exactly the failures that matter most.
+Telemetry, downloads, install gating, and rollback all fire from Swift/Kotlin — not JS. That means failures are captured even when the JS engine never boots (cold-start rollbacks, post-install crashes). A JS-only emitter would silently miss exactly the failures that matter most.
+
+---
+
+## Links
+
+- [Getting started](https://docs.nitropush.org/getting-started)
+- [Native setup (iOS & Android)](https://docs.nitropush.org/native-setup)
+- [Expo / managed workflow](https://docs.nitropush.org/expo)
+- [SDK API reference](https://docs.nitropush.org/sdk)
+- [CLI reference](https://docs.nitropush.org/cli)
+- [Release channels & rollouts](https://docs.nitropush.org/rollouts)
+- [Bundle signing](https://docs.nitropush.org/bundle-signing)
+- [Delta bundle updates](https://docs.nitropush.org/delta-updates)
+
+---
 
 ## Contributing
 
