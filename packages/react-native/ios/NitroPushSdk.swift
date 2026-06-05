@@ -958,18 +958,11 @@ extension NitroPushSdk {
 
     private func reloadBridge() {
         DispatchQueue.main.async {
-#if canImport(React)
-            if let cls = NSClassFromString("RCTReloadCommand") as AnyObject?,
-               cls.responds(to: NSSelectorFromString("triggerReloadCommandListeners:")) {
-                _ = cls.perform(NSSelectorFromString("triggerReloadCommandListeners:"),
-                                with: "NitroPush install")
-            } else {
-                NotificationCenter.default.post(
-                    name: NSNotification.Name("RCTBridgeWillReloadNotification"),
-                    object: nil
-                )
-            }
-#endif
+            // NitroPushTriggerReload is defined in NitroPushReloadBridge.m and wraps
+            // RCTTriggerReloadCommandListeners (React Native 0.71+). Prior to 0.71,
+            // RCTReloadCommand was an ObjC class — that API no longer exists in
+            // RN 0.81+ so the old NSClassFromString lookup silently returned nil.
+            _nitroPushTriggerReload()
         }
     }
 

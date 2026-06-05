@@ -21,10 +21,10 @@ import {
 // in by the config plugin (no-arg configure() path).
 const client = process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY
   ? configureWith({
-      serverUrl:      process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL      ?? "",
-      deploymentKey:  process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY  ?? "",
-      storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL ?? "",
-    })
+    serverUrl: process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL ?? "",
+    deploymentKey: process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY ?? "",
+    storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL ?? "",
+  })
   : configure();
 
 export default function HomeScreen() {
@@ -61,7 +61,7 @@ export default function HomeScreen() {
     await sync(
       client,
       {
-        installMode: InstallMode.ON_NEXT_RESUME,
+        installMode: InstallMode.IMMEDIATE,
         mandatoryInstallMode: InstallMode.IMMEDIATE,
         minimumBackgroundDuration: 60,
       },
