@@ -23,8 +23,13 @@ For iOS, run `pod install` after installing.
 ## Quick start
 
 ```ts
-import { configure, sync, InstallMode, SyncStatus } from '@nitropush/react-native';
-import { useEffect } from 'react';
+import {
+  configure,
+  sync,
+  InstallMode,
+  SyncStatus,
+} from "@nitropush/react-native";
+import { useEffect } from "react";
 
 // Reads serverUrl / deploymentKey / storageBaseUrl from native config
 // (Info.plist on iOS, strings.xml on Android)
@@ -35,7 +40,7 @@ export default function App() {
     client.notifyAppReady();
     sync(client, { installMode: InstallMode.ON_NEXT_RESUME }, (status) => {
       if (status === SyncStatus.UPDATE_INSTALLED) {
-        console.log('Update installed — will apply on next resume');
+        console.log("Update installed — will apply on next resume");
       }
     });
   }, []);
@@ -63,15 +68,15 @@ if (remote) {
 
 ## Key exports
 
-| Export | Description |
-|--------|-------------|
-| `configure()` | Create a `NitroPushClient` using native config (plist / strings.xml) |
-| `configureWith(config)` | Create a `NitroPushClient` with explicit JS-side config |
-| `sync(client, options?, callback?)` | High-level check → download → install in one call |
-| `InstallMode` | Enum: `IMMEDIATE`, `ON_NEXT_RESTART`, `ON_NEXT_RESUME`, `ON_NEXT_SUSPEND` |
-| `SyncStatus` | Enum: `CHECKING_FOR_UPDATE`, `DOWNLOADING_PACKAGE`, `UPDATE_INSTALLED`, … |
-| `NitroPushConfig` | Config shape for `configureWith` / `configure` |
-| `SyncOptions` | Options for `sync()` (install mode, dialogs, rollback, …) |
+| Export                              | Description                                                               |
+| ----------------------------------- | ------------------------------------------------------------------------- |
+| `configure()`                       | Create a `NitroPushClient` using native config (plist / strings.xml)      |
+| `configureWith(config)`             | Create a `NitroPushClient` with explicit JS-side config                   |
+| `sync(client, options?, callback?)` | High-level check → download → install in one call                         |
+| `InstallMode`                       | Enum: `IMMEDIATE`, `ON_NEXT_RESTART`, `ON_NEXT_RESUME`, `ON_NEXT_SUSPEND` |
+| `SyncStatus`                        | Enum: `CHECKING_FOR_UPDATE`, `DOWNLOADING_PACKAGE`, `UPDATE_INSTALLED`, … |
+| `NitroPushConfig`                   | Config shape for `configureWith` / `configure`                            |
+| `SyncOptions`                       | Options for `sync()` (install mode, dialogs, rollback, …)                 |
 
 ---
 
