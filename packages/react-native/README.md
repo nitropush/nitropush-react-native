@@ -16,23 +16,96 @@ npm install @nitropush/react-native react-native-nitro-modules
 yarn add @nitropush/react-native react-native-nitro-modules
 ```
 
-For iOS, run `pod install` after installing.
+Then run `pod install` for iOS:
+
+```sh
+cd ios && pod install
+```
+
+---
+
+## Native setup
+
+### Android — `MainApplication.kt`
+
+Call `NitroPushSdk.install(this)` as the very first line of `onCreate`:
+
+```kotlin
+import com.nitropush.sdk.NitroPushSdk
+
+class MainApplication : Application(), ReactApplication {
+  override fun onCreate() {
+    NitroPushSdk.install(this)   // ← must be first
+    super.onCreate()
+    // ...
+  }
+}
+```
+
+Add your deployment key (and any optional overrides) as `<meta-data>` inside `<application>` in `AndroidManifest.xml`:
+
+```xml
+<application ...>
+
+  <!-- Required -->
+  <meta-data android:name="NITROPUSH_DEPLOYMENT_KEY"
+             android:value="YOUR_DEPLOYMENT_KEY" />
+
+  <!-- Optional — defaults shown -->
+  <meta-data android:name="NITROPUSH_SERVER_URL"
+             android:value="https://api.nitropush.org" />
+  <meta-data android:name="NITROPUSH_STORAGE_BASE_URL"
+             android:value="https://cdn.nitropush.org" />
+
+</application>
+```
+
+### iOS — `AppDelegate.swift`
+
+Call `NitroPushSdk.install(self)` before the React bridge starts:
+
+```swift
+import NitroPushNative
+
+@UIApplicationMain
+class AppDelegate: RCTAppDelegate {
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    NitroPushSdk.install(self)   // ← must be before super
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+}
+```
+
+Add your deployment key to `Info.plist`:
+
+```xml
+<!-- Required -->
+<key>NITROPUSH_DEPLOYMENT_KEY</key>
+<string>YOUR_DEPLOYMENT_KEY</string>
+
+<!-- Optional — defaults shown -->
+<key>NITROPUSH_SERVER_URL</key>
+<string>https://api.nitropush.org</string>
+
+<key>NITROPUSH_STORAGE_BASE_URL</key>
+<string>https://cdn.nitropush.org</string>
+```
+
+> All plist / manifest keys and their defaults are documented at [docs.nitropush.org/native-setup](https://docs.nitropush.org/native-setup).
 
 ---
 
 ## Quick start
 
 ```ts
-import {
-  configure,
-  sync,
-  InstallMode,
-  SyncStatus,
-} from "@nitropush/react-native";
+import { configure, sync, InstallMode, SyncStatus } from "@nitropush/react-native";
 import { useEffect } from "react";
 
-// Reads serverUrl / deploymentKey / storageBaseUrl from native config
-// (Info.plist on iOS, strings.xml on Android)
+// Reads NITROPUSH_DEPLOYMENT_KEY (and optional overrides) from
+// Info.plist on iOS or AndroidManifest meta-data on Android.
 const client = configure();
 
 export default function App() {
@@ -66,31 +139,48 @@ if (remote) {
 
 ---
 
+## Explicit JS config
+
+Use `configureWith` when you need to override the native config at runtime (e.g. pointing at a staging server from a debug build):
+
+```ts
+import { configureWith } from "@nitropush/react-native";
+
+const client = configureWith({
+  serverUrl: "https://api.nitropush.org",
+  deploymentKey: "YOUR_DEPLOYMENT_KEY",
+  storageBaseUrl: "https://cdn.nitropush.org",
+});
+```
+
+---
+
 ## Key exports
 
-| Export                              | Description                                                               |
-| ----------------------------------- | ------------------------------------------------------------------------- |
-| `configure()`                       | Create a `NitroPushClient` using native config (plist / strings.xml)      |
-| `configureWith(config)`             | Create a `NitroPushClient` with explicit JS-side config                   |
-| `sync(client, options?, callback?)` | High-level check → download → install in one call                         |
-| `InstallMode`                       | Enum: `IMMEDIATE`, `ON_NEXT_RESTART`, `ON_NEXT_RESUME`, `ON_NEXT_SUSPEND` |
-| `SyncStatus`                        | Enum: `CHECKING_FOR_UPDATE`, `DOWNLOADING_PACKAGE`, `UPDATE_INSTALLED`, … |
-| `NitroPushConfig`                   | Config shape for `configureWith` / `configure`                            |
-| `SyncOptions`                       | Options for `sync()` (install mode, dialogs, rollback, …)                 |
+| Export | Description |
+|--------|-------------|
+| `configure()` | Create a client — reads config from Info.plist / AndroidManifest |
+| `configureWith(config)` | Create a client with explicit JS-side config |
+| `sync(client, options?, callback?)` | High-level check → download → install in one call |
+| `InstallMode` | `IMMEDIATE` · `ON_NEXT_RESTART` · `ON_NEXT_RESUME` · `ON_NEXT_SUSPEND` |
+| `SyncStatus` | `CHECKING_FOR_UPDATE` · `DOWNLOADING_PACKAGE` · `UPDATE_INSTALLED` · … |
+| `NitroPushConfig` | Config shape for `configureWith` |
+| `SyncOptions` | Options for `sync()` (install mode, dialogs, rollback, …) |
 
 ---
 
 ## Documentation
 
-Full guides, API reference, Expo integration, and the CLI reference are available at **[docs.nitropush.org](https://docs.nitropush.org)**.
-
-- [Getting started](https://docs.nitropush.org)
-- [Expo / managed workflow](https://docs.nitropush.org)
-- [CLI reference](https://docs.nitropush.org)
-- [Release channels & rollouts](https://docs.nitropush.org)
+- [Getting started](https://docs.nitropush.org/getting-started)
+- [Native setup (iOS & Android)](https://docs.nitropush.org/native-setup)
+- [Expo / managed workflow](https://docs.nitropush.org/expo)
+- [SDK API reference](https://docs.nitropush.org/sdk)
+- [CLI reference](https://docs.nitropush.org/cli)
+- [Release channels & rollouts](https://docs.nitropush.org/rollouts)
+- [Bundle signing](https://docs.nitropush.org/bundle-signing)
 
 ---
 
 ## License
 
-MIT © [NitroPush](https://docs.nitropush.org)
+MIT © [NitroPush](https://nitropush.org)
