@@ -928,6 +928,7 @@ extension NitroPushSdk {
         defaults.set(pendingDict, forKey: DefaultsKey.active)
         defaults.removeObject(forKey: DefaultsKey.pending)
         defaults.set(true, forKey: DefaultsKey.unconfirmed)
+        persistFlag(releaseId: pending.releaseId, isFirstRun: true)
         return pending
     }
 
