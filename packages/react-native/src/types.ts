@@ -134,4 +134,17 @@ export interface NitroPushConfig {
   appVersion?: string;
   /** Optional unique device id used for deterministic rollout bucketing. */
   clientUniqueId?: string;
+  /**
+   * Enable experimental delta (binary diff) bundle updates.
+   *
+   * When `true`, the SDK sends `currentBundleHash` with every update check
+   * and downloads a bsdiff4 patch instead of the full bundle when the server
+   * offers one. Falls back to full bundle download on any patch failure.
+   *
+   * The server only provides a delta when the CLI published the release with
+   * `--delta`. Both sides must opt in for delta downloads to occur.
+   *
+   * @experimental Default: `false`.
+   */
+  enableDeltaUpdates?: boolean;
 }

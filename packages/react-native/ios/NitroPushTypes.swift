@@ -17,6 +17,11 @@ public struct NPConfig {
     /// bundles with a missing or invalid signature are rejected.
     /// When `nil` (default) signature verification is skipped.
     public let bundlePublicKey: String?
+    /// Enable experimental delta (binary diff) bundle updates.
+    /// When true, the SDK sends `currentBundleHash` with every update check
+    /// and downloads a bsdiff4 patch instead of the full bundle when offered.
+    /// Falls back to full bundle on any patch failure. Default: false.
+    public let enableDeltaUpdates: Bool
 
     public init(
         deploymentKey: String,
@@ -24,7 +29,8 @@ public struct NPConfig {
         storageBaseUrl: String = "https://cdn.nitropush.org",
         appVersion: String? = nil,
         clientUniqueId: String? = nil,
-        bundlePublicKey: String? = nil
+        bundlePublicKey: String? = nil,
+        enableDeltaUpdates: Bool = false
     ) {
         self.serverUrl = serverUrl
         self.deploymentKey = deploymentKey
@@ -32,6 +38,7 @@ public struct NPConfig {
         self.appVersion = appVersion
         self.clientUniqueId = clientUniqueId
         self.bundlePublicKey = bundlePublicKey
+        self.enableDeltaUpdates = enableDeltaUpdates
     }
 }
 
@@ -99,6 +106,9 @@ public struct NPLocalPackage {
     public let isFailedInstall: Bool
     public let isFirstRun: Bool
     public let bundlePath: String
+    /// SHA-256 of the raw JS bundle file. Used for delta update eligibility
+    /// checks — sent as `currentBundleHash` in the update-check request.
+    public let bundleHash: String?
 
     public init(
         releaseId: String,
@@ -114,7 +124,8 @@ public struct NPLocalPackage {
         isPending: Bool,
         isFailedInstall: Bool,
         isFirstRun: Bool,
-        bundlePath: String
+        bundlePath: String,
+        bundleHash: String? = nil
     ) {
         self.releaseId = releaseId
         self.label = label
@@ -130,6 +141,7 @@ public struct NPLocalPackage {
         self.isFailedInstall = isFailedInstall
         self.isFirstRun = isFirstRun
         self.bundlePath = bundlePath
+        self.bundleHash = bundleHash
     }
 }
 
