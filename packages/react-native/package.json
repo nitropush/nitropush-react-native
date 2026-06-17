@@ -45,6 +45,9 @@
     "type": "git",
     "url": "git+https://github.com/nitropush/nitropush-react-native.git"
   },
+  "bugs": {
+    "url": "https://github.com/nitropush/nitropush-react-native/issues"
+  },
   "author": "NitroPush",
   "license": "MIT",
   "publishConfig": {
