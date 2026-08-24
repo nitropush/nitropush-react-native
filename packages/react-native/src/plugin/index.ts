@@ -111,6 +111,11 @@ import {
      */
     bundlePublicKey?: string;
     /**
+     * Enable experimental bsdiff4 Delta Updates. The SDK still downloads the
+     * full bundle whenever no compatible, verified patch is available.
+     */
+    enableDeltaUpdates?: boolean;
+    /**
      * Inject a native `configure()` + background update-check `Task.detached`
      * into `AppDelegate.swift`. Only needed for **bare React Native** apps that
      * want the SDK initialised before the JS engine starts.
@@ -135,6 +140,7 @@ import {
       deploymentKey: props?.deploymentKey ?? "",
       storageBaseUrl: props?.storageBaseUrl ?? "",
       bundlePublicKey: props?.bundlePublicKey ?? "",
+      enableDeltaUpdates: props?.enableDeltaUpdates ?? false,
       nativeConfigure: props?.nativeConfigure ?? false,
     };
 
@@ -147,6 +153,8 @@ import {
         if (opts.serverUrl)       cfg.modResults["NITROPUSH_SERVER_URL"]       = opts.serverUrl;
         if (opts.storageBaseUrl)  cfg.modResults["NITROPUSH_STORAGE_BASE_URL"] = opts.storageBaseUrl;
         if (opts.bundlePublicKey) cfg.modResults["NITROPUSH_BUNDLE_PUBLIC_KEY"]= opts.bundlePublicKey;
+        if (opts.enableDeltaUpdates) cfg.modResults["NITROPUSH_ENABLE_DELTA_UPDATES"] = true;
+        else delete cfg.modResults["NITROPUSH_ENABLE_DELTA_UPDATES"];
         return cfg;
       });
     }
@@ -162,6 +170,7 @@ import {
           "NITROPUSH_SERVER_URL",
           "NITROPUSH_STORAGE_BASE_URL",
           "NITROPUSH_BUNDLE_PUBLIC_KEY",
+          "NITROPUSH_ENABLE_DELTA_UPDATES",
         ];
         // Remove stale entries first (idempotent re-runs).
         mainApp["meta-data"] = (mainApp["meta-data"] ?? []).filter(
@@ -173,6 +182,7 @@ import {
         if (opts.serverUrl)       entries.push(["NITROPUSH_SERVER_URL",        opts.serverUrl]);
         if (opts.storageBaseUrl)  entries.push(["NITROPUSH_STORAGE_BASE_URL",  opts.storageBaseUrl]);
         if (opts.bundlePublicKey) entries.push(["NITROPUSH_BUNDLE_PUBLIC_KEY", opts.bundlePublicKey]);
+        if (opts.enableDeltaUpdates) entries.push(["NITROPUSH_ENABLE_DELTA_UPDATES", "true"]);
         for (const [name, value] of entries) {
           mainApp["meta-data"].push({ $: { "android:name": name, "android:value": value } });
         }
@@ -555,10 +565,9 @@ import {
         );
       }
     }
-  
     return src;
   }
-  
+
   // ─── Android: MainApplication patching ───────────────────────────────────────
   
   const TAG_ANDROID_IMPORT = "nitropush-android-import";
@@ -623,6 +632,5 @@ import {
   }
   
   // ─────────────────────────────────────────────────────────────────────────────
-  
+
   export default createRunOncePlugin(withNitroPush, PKG_NAME, PKG_VERSION);
-  

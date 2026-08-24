@@ -6,7 +6,6 @@ import { ThemedView } from "@/components/themed-view";
 
 import {
   configure,
-  configureWith,
   InstallMode,
   sync,
   SyncStatus,
@@ -16,16 +15,9 @@ import {
 
 
 // Build the client once at module scope.
-// In dev: EXPO_PUBLIC_* env vars (from .env) point at the local server.
-// In production: fall back to Info.plist / AndroidManifest values baked
-// in by the config plugin (no-arg configure() path).
-const client = process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY
-  ? configureWith({
-    serverUrl: process.env.EXPO_PUBLIC_NITROPUSH_SERVER_URL ?? "",
-    deploymentKey: process.env.EXPO_PUBLIC_NITROPUSH_DEPLOYMENT_KEY ?? "",
-    storageBaseUrl: process.env.EXPO_PUBLIC_NITROPUSH_STORAGE_BASE_URL ?? "",
-  })
-  : configure();
+// Expo apps read serverUrl / deploymentKey / storageBaseUrl from native
+// Info.plist / AndroidManifest values injected by the config plugin.
+const client = configure();
 
 export default function HomeScreen() {
   // First-paint reads via the sync helper — avoids a microtask hop so the

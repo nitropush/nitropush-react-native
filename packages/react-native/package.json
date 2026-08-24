@@ -9,6 +9,9 @@
   "source": "src/index",
   "scripts": {
     "build:plugin": "tsc -p tsconfig.plugin.json",
+    "prepack": "yarn build:plugin",
+    "test": "yarn test:delta:golden && node --test test/security-source.test.mjs",
+    "test:delta:golden": "cd test/delta-fixtures && shasum -a 256 -c SHA256SUMS && cd ../.. && bash ios/Tests/run-bspatch-golden.sh && bash android/src/test/native/run-bspatch-golden.sh",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf android/build node_modules/**/android/build lib nitrogen/generated",
     "codegen": "nitrogen --logLevel=\"debug\" && node post-script.js",
@@ -22,6 +25,8 @@
     "ota"
   ],
   "files": [
+    "app.plugin.js",
+    "plugin/build",
     "src",
     "react-native.config.js",
     "nitrogen",

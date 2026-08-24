@@ -9,7 +9,7 @@ with `npx create-expo-app@latest --template default`, then wired to
 | File | What was added |
 | ---- | -------------- |
 | `package.json` | Workspace name `@nitropush/expo-example`, dep on `@nitropush/react-native` (workspace) + `react-native-nitro-modules` |
-| `app.json` | `ios.bundleIdentifier`, `android.package`, `plugins[…]` entry for `@nitropush/react-native` (`{ ios: true, android: true }`), `extra.nitropushServerUrl` / `extra.nitropushDeploymentKey` |
+| `app.json` | `ios.bundleIdentifier`, `android.package`, `plugins[…]` entry for `@nitropush/react-native` with hosted `serverUrl`, `deploymentKey`, and `storageBaseUrl` |
 | `app/(tabs)/index.tsx` | Demo screen — `configure()`, `notifyAppReady()`, `sync()` with status + progress, `restartApp(true)` |
 
 The native side (AppDelegate / MainApplication patches) is injected at
@@ -24,6 +24,5 @@ yarn workspace @nitropush/expo-example ios    # prebuilds + runs iOS
 yarn workspace @nitropush/expo-example android
 ```
 
-Point the demo at your dev server by editing `extra.nitropushServerUrl`
-and `extra.nitropushDeploymentKey` in `app.json` (or set them via EAS
-secrets in production).
+Point the demo at a different environment by editing the
+`@nitropush/react-native` plugin config in `app.json` and re-running prebuild.

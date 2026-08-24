@@ -38,6 +38,8 @@ namespace margelo::nitro::nitropush {
       jni::local_ref<jni::JString> deploymentKey = this->getFieldValue(fieldDeploymentKey);
       static const auto fieldStorageBaseUrl = clazz->getField<jni::JString>("storageBaseUrl");
       jni::local_ref<jni::JString> storageBaseUrl = this->getFieldValue(fieldStorageBaseUrl);
+      static const auto fieldBundlePublicKey = clazz->getField<jni::JString>("bundlePublicKey");
+      jni::local_ref<jni::JString> bundlePublicKey = this->getFieldValue(fieldBundlePublicKey);
       static const auto fieldAppVersion = clazz->getField<jni::JString>("appVersion");
       jni::local_ref<jni::JString> appVersion = this->getFieldValue(fieldAppVersion);
       static const auto fieldClientUniqueId = clazz->getField<jni::JString>("clientUniqueId");
@@ -48,6 +50,7 @@ namespace margelo::nitro::nitropush {
         serverUrl->toStdString(),
         deploymentKey->toStdString(),
         storageBaseUrl->toStdString(),
+        bundlePublicKey != nullptr ? std::make_optional(bundlePublicKey->toStdString()) : std::nullopt,
         appVersion != nullptr ? std::make_optional(appVersion->toStdString()) : std::nullopt,
         clientUniqueId != nullptr ? std::make_optional(clientUniqueId->toStdString()) : std::nullopt,
         enableDeltaUpdates != nullptr ? std::make_optional(static_cast<bool>(enableDeltaUpdates->value())) : std::nullopt
@@ -60,7 +63,7 @@ namespace margelo::nitro::nitropush {
      */
     [[maybe_unused]]
     static jni::local_ref<JNitroPushConfig::javaobject> fromCpp(const NitroPushConfig& value) {
-      using JSignature = JNitroPushConfig(jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JBoolean>);
+      using JSignature = JNitroPushConfig(jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JString>, jni::alias_ref<jni::JBoolean>);
       static const auto clazz = javaClassStatic();
       static const auto create = clazz->getStaticMethod<JSignature>("fromCpp");
       return create(
@@ -68,6 +71,7 @@ namespace margelo::nitro::nitropush {
         jni::make_jstring(value.serverUrl),
         jni::make_jstring(value.deploymentKey),
         jni::make_jstring(value.storageBaseUrl),
+        value.bundlePublicKey.has_value() ? jni::make_jstring(value.bundlePublicKey.value()) : nullptr,
         value.appVersion.has_value() ? jni::make_jstring(value.appVersion.value()) : nullptr,
         value.clientUniqueId.has_value() ? jni::make_jstring(value.clientUniqueId.value()) : nullptr,
         value.enableDeltaUpdates.has_value() ? jni::JBoolean::valueOf(value.enableDeltaUpdates.value()) : nullptr

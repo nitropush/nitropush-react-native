@@ -15,6 +15,7 @@ import com.facebook.react.ReactApplication
 import com.facebook.react.ReactNativeHost
 import org.json.JSONObject
 import android.util.Base64
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -22,6 +23,8 @@ import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
+import java.text.Normalizer
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -114,6 +117,7 @@ class NitroPushSdk private constructor(
                 appVersion = meta.getString("NITROPUSH_APP_VERSION"),
                 clientUniqueId = meta.getString("NITROPUSH_CLIENT_UNIQUE_ID"),
                 bundlePublicKey = meta.getString("NITROPUSH_BUNDLE_PUBLIC_KEY"),
+                enableDeltaUpdates = meta.getBoolean("NITROPUSH_ENABLE_DELTA_UPDATES", false),
             )
         }
     }
@@ -156,12 +160,35 @@ class NitroPushSdk private constructor(
     private var storageBaseUrl: String? = null
     private var appVersion: String? = null
     private var clientUniqueId: String? = null
+    /** Server-issued proof, scoped to the configured server + deployment. */
+    private var deviceToken: String? = null
+    private var deviceTokenStorageKey: String? = null
     /** Base64-encoded DER SubjectPublicKeyInfo for ECDSA P-256 bundle
      *  signature verification. `null` means verification is skipped. */
     private var bundlePublicKey: String? = null
     /** Experimental: when true, send currentBundleHash in update checks and
      *  attempt delta download/patch before falling back to full bundle. */
     private var enableDeltaUpdates: Boolean = false
+    /** SHA-256 of the JS bundle packaged in the APK/AAB, used before the first OTA. */
+    private val embeddedBundleHash: String? by lazy {
+        val names = listOf("index.android.bundle", "main.jsbundle", "main.hbc")
+        for (name in names) {
+            val digest = runCatching {
+                val md = MessageDigest.getInstance("SHA-256")
+                applicationContext.assets.open(name).use { input ->
+                    val buffer = ByteArray(256 * 1024)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        md.update(buffer, 0, count)
+                    }
+                }
+                md.digest().joinToString("") { "%02x".format(it) }
+            }.getOrNull()
+            if (digest != null) return@lazy digest
+        }
+        null
+    }
 
     private val progressListeners = mutableMapOf<Int, (NPDownloadProgress) -> Unit>()
     private var nextListenerId = 1
@@ -192,6 +219,11 @@ class NitroPushSdk private constructor(
      */
     private val reportedFirstRuns = mutableSetOf<String>()
 
+    private val releaseFilesManifestName = ".nitropush-files.json"
+    private val maxCacheBytes = 50L * 1024L * 1024L
+    private val targetCacheBytesAfterPrune = 40L * 1024L * 1024L
+    private val maxUnprotectedCacheAgeMs = 14L * 24L * 60L * 60L * 1000L
+
     fun configure(config: NPConfig) {
         log("configure") {
             "serverUrl=${config.serverUrl} deploymentKey=${config.deploymentKey.take(20)}… " +
@@ -204,6 +236,12 @@ class NitroPushSdk private constructor(
         storageBaseUrl = storage.trimEnd('/')
         appVersion = config.appVersion ?: binaryAppVersion()
         clientUniqueId = config.clientUniqueId ?: fallbackDeviceId()
+        val tokenScopeHash = MessageDigest.getInstance("SHA-256")
+            .digest("${serverUrl}\u0000${config.deploymentKey}".toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val tokenKey = "nitropush.deviceToken.$tokenScopeHash"
+        deviceTokenStorageKey = tokenKey
+        deviceToken = prefs.getString(tokenKey, null)
         bundlePublicKey = config.bundlePublicKey
         enableDeltaUpdates = config.enableDeltaUpdates
 
@@ -220,6 +258,7 @@ class NitroPushSdk private constructor(
         // mutated state. Now that the emitter is wired, replay any pending
         // rollback event once.
         detectAndReportRollback()
+        pruneUnusedBundlesAndCache()
     }
 
     /** Resolve a bucket-relative `objectKey` to an absolute URL. */
@@ -326,6 +365,7 @@ class NitroPushSdk private constructor(
             .putBoolean(Keys.UNCONFIRMED, false)
             .remove(Keys.PREVIOUS)
             .apply()
+        pruneUnusedBundlesAndCache()
     }
 
     fun restartApp(onlyIfUpdateIsPending: Boolean) {
@@ -349,6 +389,7 @@ class NitroPushSdk private constructor(
         prefs.edit().remove(Keys.PENDING).apply()
         pendingResume = null
         pendingSuspend = null
+        pruneUnusedBundlesAndCache()
     }
 
     /**
@@ -371,6 +412,7 @@ class NitroPushSdk private constructor(
                 prefs.edit().remove(Keys.PENDING).apply()
                 pendingResume = null
                 pendingSuspend = null
+                pruneUnusedBundlesAndCache()
                 return
             }
         }
@@ -399,6 +441,7 @@ class NitroPushSdk private constructor(
         editor.putBoolean(Keys.UNCONFIRMED, false)
         editor.apply()
         deleteBundleDir(releaseId)
+        pruneUnusedBundlesAndCache()
         reloadBridge()
     }
 
@@ -587,6 +630,7 @@ class NitroPushSdk private constructor(
                         activatePending()
                         reloadBridge()
                         pendingResume = null
+                        pruneUnusedBundlesAndCache()
                     }
                 }
             })
@@ -603,11 +647,12 @@ class NitroPushSdk private constructor(
         )
         appVersion?.let { params["appVersion"] = it }
         clientUniqueId?.let { params["clientUniqueId"] = it }
-        readActive()?.let { active ->
+        val active = readActive()
+        active?.let {
             params["currentReleaseId"] = active.releaseId
-            if (enableDeltaUpdates) {
-                active.bundleHash?.let { params["currentBundleHash"] = it }
-            }
+        }
+        if (enableDeltaUpdates) {
+            (active?.bundleHash ?: embeddedBundleHash)?.let { params["currentBundleHash"] = it }
         }
 
         val query = params.entries.joinToString("&") {
@@ -620,9 +665,16 @@ class NitroPushSdk private constructor(
             requestMethod = "GET"
             connectTimeout = 60_000
             readTimeout = 60_000
+            deviceToken?.let { setRequestProperty("x-nitropush-device-token", it) }
         }
         try {
             val code = conn.responseCode
+            conn.getHeaderField("x-nitropush-device-token")
+                ?.takeIf { it.isNotEmpty() && it.toByteArray(Charsets.UTF_8).size <= 2_048 }
+                ?.let { issuedToken ->
+                    deviceToken = issuedToken
+                    deviceTokenStorageKey?.let { prefs.edit().putString(it, issuedToken).apply() }
+                }
             if (code == 204) return null
             if (code !in 200..299) {
                 val errBody = runCatching {
@@ -671,10 +723,28 @@ class NitroPushSdk private constructor(
                 isMandatory = r.optBoolean("isMandatory", false),
                 description = r.optString("description").takeIf { it.isNotEmpty() },
                 downloadObjectKey = r.getString("downloadObjectKey"),
+                delta = if (
+                    r.has("deltaFromBundleHash") &&
+                    r.has("deltaObjectKey") &&
+                    r.has("deltaSizeBytes") &&
+                    r.has("deltaPatchSha256")
+                ) {
+                    NPDeltaPatch(
+                        fromBundleHash = r.getString("deltaFromBundleHash"),
+                        patchObjectKey = r.getString("deltaObjectKey"),
+                        patchSize = r.getInt("deltaSizeBytes"),
+                        patchSha256 = r.getString("deltaPatchSha256"),
+                        algorithm = r.optString("deltaAlgorithm", "bsdiff4"),
+                    )
+                } else null,
             )
             // Cache the pre-signed manifest proxy URL for use in downloadManifestRelease.
             r.optString("downloadUrl").takeIf { it.isNotEmpty() }?.let {
-                manifestUrlOverride[pkg.releaseId] = it
+                manifestUrlOverride[pkg.releaseId] = if (it.startsWith("http://") || it.startsWith("https://")) {
+                    it
+                } else {
+                    "${server.trimEnd('/')}/${it.trimStart('/')}"
+                }
             }
             return pkg
         } finally {
@@ -726,11 +796,61 @@ class NitroPushSdk private constructor(
      * RN's relative-to-bundle asset resolution still works. Used for both
      * `expo` and `codepush` kinds — the manifest format is identical.
      */
+    private fun safeReleaseDestination(
+        originalPath: String,
+        releaseDir: File,
+        occupied: MutableSet<String>,
+    ): File {
+        val segments = originalPath.split("/")
+        check(
+            originalPath.isNotEmpty() &&
+                originalPath.toByteArray(Charsets.UTF_8).size <= 512 &&
+                originalPath == Normalizer.normalize(originalPath, Normalizer.Form.NFC) &&
+                !originalPath.startsWith("/") &&
+                !originalPath.endsWith("/") &&
+                !originalPath.contains('\\') &&
+                originalPath.none { it.code < 0x20 || it.code == 0x7f } &&
+                segments.none {
+                    it.isEmpty() || it == "." || it == ".." ||
+                        it.lowercase(Locale.ROOT) == releaseFilesManifestName
+                }
+        ) { "unsafe release path: $originalPath" }
+        check(occupied.add(originalPath.lowercase(Locale.ROOT))) {
+            "duplicate or colliding release path: $originalPath"
+        }
+        val root = releaseDir.canonicalFile
+        val destination = File(root, originalPath).canonicalFile
+        check(destination.path.startsWith(root.path + File.separator)) {
+            "release path escapes staging directory"
+        }
+        return destination
+    }
+
+    private fun manifestIntegrityPayload(manifest: JSONObject): String {
+        val bundle = manifest.getJSONObject("bundle")
+        check(bundle.has("size")) { "signed manifest is missing bundle size" }
+        fun line(kind: String, entry: JSONObject): String {
+            check(entry.has("size")) { "signed manifest entry is missing size" }
+            val path = entry.getString("originalPath")
+            return "$kind:${path.toByteArray(Charsets.UTF_8).size}:$path:${entry.getString("sha256")}:${entry.getLong("size")}\n"
+        }
+        val assets = manifest.optJSONArray("assets") ?: org.json.JSONArray()
+        return buildString {
+            append("nitropush-manifest-v1\n")
+            append(line("bundle", bundle))
+            append("assets:${assets.length()}\n")
+            for (i in 0 until assets.length()) append(line("asset", assets.getJSONObject(i)))
+        }
+    }
+
     private fun downloadManifestRelease(pkg: NPRemotePackage, releaseDir: File): String {
         val manifestUrl = manifestUrlOverride[pkg.releaseId]
             ?: resolveObjectUrl(pkg.downloadObjectKey)
         log("downloadManifestRelease") { "GET $manifestUrl" }
         val manifestText = httpGetString(manifestUrl)
+        check(manifestText.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024) {
+            "release manifest exceeds the allowed size"
+        }
         val manifest = try {
             JSONObject(manifestText)
         } catch (e: Throwable) {
@@ -748,36 +868,97 @@ class NitroPushSdk private constructor(
             )
         }
 
+        val schemaVersion = manifest.optInt("schemaVersion", 2)
+        check(schemaVersion == 2 || schemaVersion == 3) {
+            "unsupported release manifest schema $schemaVersion"
+        }
         val bundleObj = manifest.getJSONObject("bundle")
         val bundleSha256 = bundleObj.getString("sha256")
         val bundleObjectKey = bundleObj.getString("objectKey")
         val bundleOriginalPath = bundleObj.getString("originalPath")
+        val bundleSize = bundleObj.optInt("size", -1)
         val bundleSignature = bundleObj.optString("signature").takeIf { it.isNotEmpty() }
-        val bundleDest = File(releaseDir, bundleOriginalPath).also { it.parentFile?.mkdirs() }
+        check(pkg.packageHash.lowercase(Locale.ROOT) == bundleSha256) {
+            "release metadata does not match its manifest bundle"
+        }
+        check(Regex("^[a-f0-9]{64}$").matches(bundleSha256)) { "bundle SHA-256 is invalid" }
+        if (bundleSize >= 0) check(bundleSize in 1..(64 * 1024 * 1024)) {
+            "bundle size is outside the allowed range"
+        }
+
+        val assets = manifest.optJSONArray("assets") ?: org.json.JSONArray()
+        check(assets.length() <= 10_000) { "release manifest contains too many assets" }
+        val occupied = mutableSetOf<String>()
+        val bundleDest = safeReleaseDestination(bundleOriginalPath, releaseDir, occupied)
+            .also { it.parentFile?.mkdirs() }
+        var totalBytes = maxOf(bundleSize, 0).toLong()
+        val assetDestinations = ArrayList<File>(assets.length())
+        for (i in 0 until assets.length()) {
+            val asset = assets.getJSONObject(i)
+            val assetHash = asset.getString("sha256")
+            check(Regex("^[a-f0-9]{64}$").matches(assetHash)) { "asset SHA-256 is invalid" }
+            val assetSize = asset.optInt("size", -1)
+            if (assetSize >= 0) {
+                check(assetSize in 1..(16 * 1024 * 1024)) { "asset size is outside the allowed range" }
+                totalBytes += assetSize
+            }
+            assetDestinations += safeReleaseDestination(
+                asset.getString("originalPath"), releaseDir, occupied,
+            )
+        }
+        check(totalBytes <= 128L * 1024L * 1024L) { "release content exceeds the allowed size" }
+
+        bundlePublicKey?.let { pubKey ->
+            check(schemaVersion == 3) {
+                "signed projects require manifest schema 3; refusing legacy downgrade"
+            }
+            check(bundleSignature != null) {
+                "bundle is unsigned but a bundlePublicKey is configured — refusing to install"
+            }
+            verifyBundleSignature(bundleSha256, bundleSignature, pubKey)
+            val integritySignature = manifest.optString("integritySignature")
+                .takeIf { it.isNotEmpty() }
+                ?: error("signed manifest is missing its integrity signature")
+            verifySignature(
+                manifestIntegrityPayload(manifest),
+                integritySignature,
+                pubKey,
+                "release manifest",
+            )
+        }
 
         // Experimental delta path: attempt patch application, fall back to full download.
         val deltaObj = bundleObj.optJSONObject("delta")
+        val selectedDelta = pkg.delta ?: deltaObj?.let {
+            NPDeltaPatch(
+                fromBundleHash = it.getString("fromBundleHash"),
+                patchObjectKey = it.getString("patchObjectKey"),
+                patchSize = it.getInt("patchSize"),
+                patchSha256 = it.getString("patchSha256"),
+                algorithm = it.optString("algorithm", "bsdiff4"),
+            )
+        }
         val activeBundleHash = readActive()?.bundleHash
         val canUseDelta = enableDeltaUpdates &&
-            deltaObj != null &&
+            selectedDelta != null &&
             activeBundleHash != null &&
-            deltaObj.optString("algorithm") == "bsdiff4" &&
-            activeBundleHash == deltaObj.optString("fromBundleHash")
+            selectedDelta.algorithm == "bsdiff4" &&
+            activeBundleHash == selectedDelta.fromBundleHash
 
         var usedDelta = false
-        if (canUseDelta && deltaObj != null) {
+        if (canUseDelta && selectedDelta != null) {
             try {
                 applyDeltaPatch(
-                    patchObjectKey = deltaObj.getString("patchObjectKey"),
-                    patchSha256 = deltaObj.getString("patchSha256"),
-                    patchSize = deltaObj.getInt("patchSize"),
-                    fromBundleHash = deltaObj.getString("fromBundleHash"),
+                    patchObjectKey = selectedDelta.patchObjectKey,
+                    patchSha256 = selectedDelta.patchSha256,
+                    patchSize = selectedDelta.patchSize,
+                    fromBundleHash = selectedDelta.fromBundleHash,
                     expectedOutputSha256 = bundleSha256,
                     dest = bundleDest,
                 )
                 usedDelta = true
-                log("downloadManifestRelease → applied delta patch") { deltaObj.getString("patchSha256") }
-                val patchSize = deltaObj.getInt("patchSize")
+                log("downloadManifestRelease → applied delta patch") { selectedDelta.patchSha256 }
+                val patchSize = selectedDelta.patchSize
                 val fullSize = pkg.packageSize.toInt()
                 emit(
                     type = "download_delta_applied",
@@ -806,34 +987,21 @@ class NitroPushSdk private constructor(
         if (!usedDelta) {
             val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(bundleObjectKey)
-            fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest)
+            fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest, bundleSize.toLong())
         }
 
-        bundlePublicKey?.let { pubKey ->
-            if (bundleSignature == null) {
-                releaseDir.deleteRecursively()
-                error("bundle is unsigned but a bundlePublicKey is configured — refusing to install")
-            }
-            try {
-                verifyBundleSignature(bundleSha256, bundleSignature, pubKey)
-                log("downloadManifestRelease → signature OK") { bundleSha256 }
-            } catch (e: Throwable) {
-                releaseDir.deleteRecursively()
-                throw e
-            }
-        }
-
-        val assets = manifest.optJSONArray("assets") ?: org.json.JSONArray()
+        val cachedHashes = mutableSetOf(bundleSha256)
         val total = assets.length()
         for (i in 0 until total) {
             val a = assets.getJSONObject(i)
-            val originalPath = a.getString("originalPath")
             val sha256 = a.getString("sha256")
+            val size = a.optLong("size", -1)
             val objectKey = a.getString("objectKey")
             val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(objectKey)
-            val dest = File(releaseDir, originalPath).also { it.parentFile?.mkdirs() }
-            fetchByContentHash(assetDownloadUrl, sha256, dest)
+            val dest = assetDestinations[i].also { it.parentFile?.mkdirs() }
+            fetchByContentHash(assetDownloadUrl, sha256, dest, size)
+            cachedHashes.add(sha256)
 
             // Coarse progress in the absence of byte totals: 1 unit per asset.
             emitProgress(
@@ -844,6 +1012,12 @@ class NitroPushSdk private constructor(
             )
         }
 
+        check(sha256Hex(bundleDest) == bundleSha256) {
+            releaseDir.deleteRecursively()
+            "bundle changed while assets were installed"
+        }
+
+        writeReleaseFilesManifest(releaseDir, cachedHashes)
         return bundleDest.absolutePath
     }
 
@@ -852,15 +1026,33 @@ class NitroPushSdk private constructor(
      * is kept at `nitropush/cache/<hash>`. If present, hardlink/copy to
      * `dest` and skip the network. Otherwise download, verify, copy.
      */
-    private fun fetchByContentHash(url: String, sha256: String, dest: File) {
+    private fun fetchByContentHash(url: String, sha256: String, dest: File, announcedSize: Long) {
         val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
         val cached = File(cache, sha256)
         if (cached.exists()) {
-            cached.copyTo(dest, overwrite = true)
-            return
+            if (sha256Hex(cached) != sha256 || (announcedSize > 0 && cached.length() != announcedSize)) {
+                cached.delete()
+            } else {
+                cached.setLastModified(System.currentTimeMillis())
+                cached.copyTo(dest, overwrite = true)
+                return
+            }
         }
-        downloadToFile(url, cached, expectedSha256 = sha256, announcedSize = -1)
+        downloadToFile(url, cached, expectedSha256 = sha256, announcedSize = announcedSize)
         cached.copyTo(dest, overwrite = true)
+    }
+
+    private fun sha256Hex(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count == -1) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**
@@ -933,6 +1125,10 @@ class NitroPushSdk private constructor(
                         output.write(buf, 0, n)
                         md.update(buf, 0, n)
                         written += n
+                        if (announcedSize > 0 && written > announcedSize) {
+                            dest.delete()
+                            error("download exceeded announced size of $announcedSize bytes")
+                        }
                         if (announcedSize > 0) {
                             emitProgress(
                                 NPDownloadProgress(
@@ -943,6 +1139,10 @@ class NitroPushSdk private constructor(
                         }
                     }
                 }
+            }
+            if (announcedSize > 0 && dest.length() != announcedSize) {
+                dest.delete()
+                error("download size mismatch: expected $announcedSize, received ${dest.length()}")
             }
             if (expectedSha256.isNotEmpty()) {
                 val actual = md.digest().joinToString("") { "%02x".format(it) }
@@ -969,6 +1169,20 @@ class NitroPushSdk private constructor(
         signatureBase64: String,
         publicKeyBase64: String,
     ) {
+        verifySignature(
+            "bundle:$sha256",
+            signatureBase64,
+            publicKeyBase64,
+            "bundle",
+        )
+    }
+
+    private fun verifySignature(
+        message: String,
+        signatureBase64: String,
+        publicKeyBase64: String,
+        description: String,
+    ) {
         val pubKeyBytes = try {
             Base64.decode(publicKeyBase64, Base64.DEFAULT)
         } catch (e: Throwable) {
@@ -977,7 +1191,7 @@ class NitroPushSdk private constructor(
         val sigBytes = try {
             Base64.decode(signatureBase64, Base64.DEFAULT)
         } catch (e: Throwable) {
-            error("bundle signature is not valid base64: ${e.message}")
+            error("$description signature is not valid base64: ${e.message}")
         }
         val publicKey = try {
             KeyFactory.getInstance("EC")
@@ -988,12 +1202,12 @@ class NitroPushSdk private constructor(
         val valid = try {
             val sig = Signature.getInstance("SHA256withECDSA")
             sig.initVerify(publicKey)
-            sig.update("bundle:$sha256".toByteArray(Charsets.UTF_8))
+            sig.update(message.toByteArray(Charsets.UTF_8))
             sig.verify(sigBytes)
         } catch (e: Throwable) {
             error("bundle signature verification error: ${e.message}")
         }
-        check(valid) { "bundle signature mismatch for sha256 $sha256" }
+        check(valid) { "$description signature mismatch" }
     }
 
     /** GET → string. Used for the small Expo manifest fetch. */
@@ -1001,6 +1215,7 @@ class NitroPushSdk private constructor(
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 60_000
             readTimeout = 60_000
+            deviceToken?.let { setRequestProperty("x-nitropush-device-token", it) }
         }
         try {
             val code = conn.responseCode
@@ -1017,7 +1232,19 @@ class NitroPushSdk private constructor(
                     )
                 )
             }
-            return conn.inputStream.bufferedReader().use { it.readText() }
+            return conn.inputStream.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(16 * 1024)
+                var total = 0
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count == -1) break
+                    total += count
+                    check(total <= 2 * 1024 * 1024) { "release manifest exceeds the allowed size" }
+                    output.write(buffer, 0, count)
+                }
+                output.toString(Charsets.UTF_8.name())
+            }
         } finally {
             conn.disconnect()
         }
@@ -1064,8 +1291,78 @@ class NitroPushSdk private constructor(
     private fun readPending(): NPLocalPackage? =
         prefs.getString(Keys.PENDING, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
 
+    private fun readPrevious(): NPLocalPackage? =
+        prefs.getString(Keys.PREVIOUS, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
+
     private fun deleteBundleDir(releaseId: String) {
         File(applicationContext.filesDir, "nitropush/$releaseId").deleteRecursively()
+    }
+
+    private fun pruneUnusedBundlesAndCache() {
+        val protectedPackages = listOfNotNull(readActive(), readPending(), readPrevious())
+        val protectedReleaseIds = protectedPackages.map { it.releaseId }.toSet()
+        val protectedHashes = protectedPackages
+            .flatMap { readReleaseFileHashes(it.releaseId) }
+            .toSet()
+        val root = File(applicationContext.filesDir, "nitropush")
+
+        root.listFiles()?.forEach { entry ->
+            if (!entry.isDirectory) return@forEach
+            if (entry.name == "cache") return@forEach
+            if (entry.name in protectedReleaseIds) return@forEach
+            entry.deleteRecursively()
+        }
+
+        pruneContentCache(protectedHashes)
+    }
+
+    private fun writeReleaseFilesManifest(releaseDir: File, hashes: Set<String>) {
+        val arr = org.json.JSONArray()
+        hashes.sorted().forEach { arr.put(it) }
+        val payload = JSONObject()
+            .put("schemaVersion", 1)
+            .put("cachedHashes", arr)
+        runCatching {
+            File(releaseDir, releaseFilesManifestName).writeText(payload.toString())
+        }
+    }
+
+    private fun readReleaseFileHashes(releaseId: String): List<String> {
+        val manifest = File(
+            File(applicationContext.filesDir, "nitropush/$releaseId"),
+            releaseFilesManifestName,
+        )
+        if (!manifest.exists()) return emptyList()
+        return runCatching {
+            val arr = JSONObject(manifest.readText()).optJSONArray("cachedHashes")
+                ?: return@runCatching emptyList()
+            List(arr.length()) { idx -> arr.getString(idx) }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun pruneContentCache(protectedHashes: Set<String>) {
+        val cache = File(applicationContext.filesDir, "nitropush/cache")
+        val files = cache.listFiles()?.filter { it.isFile } ?: return
+        val now = System.currentTimeMillis()
+        var totalBytes = files.sumOf { it.length() }
+        val candidates = mutableListOf<File>()
+
+        for (file in files) {
+            if (file.name in protectedHashes) continue
+            candidates.add(file)
+            if (now - file.lastModified() > maxUnprotectedCacheAgeMs) {
+                val size = file.length()
+                if (file.delete()) totalBytes -= size
+            }
+        }
+
+        if (totalBytes <= maxCacheBytes) return
+        for (file in candidates.sortedBy { it.lastModified() }) {
+            if (totalBytes <= targetCacheBytesAfterPrune) break
+            if (!file.exists()) continue
+            val size = file.length()
+            if (file.delete()) totalBytes -= size
+        }
     }
 
     private fun persistFlag(
@@ -1157,4 +1454,3 @@ private fun NPLocalPackage.Companion.fromJson(obj: JSONObject): NPLocalPackage {
         bundleHash = obj.optString("bundleHash").takeIf { it.isNotEmpty() },
     )
 }
-

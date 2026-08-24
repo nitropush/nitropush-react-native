@@ -42,6 +42,14 @@ public struct NPConfig {
     }
 }
 
+public struct NPDeltaPatch {
+    public let fromBundleHash: String
+    public let patchObjectKey: String
+    public let patchSize: Int
+    public let patchSha256: String
+    public let algorithm: String
+}
+
 public struct NPRemotePackage {
     public let releaseId: String
     /// "codepush" (tarball) or "expo" (manifest).
@@ -61,6 +69,8 @@ public struct NPRemotePackage {
     /// Bucket-relative key. SDK joins with `NlConfig.storageBaseUrl`.
     /// Codepush → tarball key; expo → manifest key.
     public let downloadObjectKey: String
+    /// Patch selected by the server for this device's current bundle hash.
+    public let delta: NPDeltaPatch?
 
     public init(
         releaseId: String,
@@ -74,7 +84,8 @@ public struct NPRemotePackage {
         platforms: [String]? = nil,
         isMandatory: Bool,
         description: String?,
-        downloadObjectKey: String
+        downloadObjectKey: String,
+        delta: NPDeltaPatch? = nil
     ) {
         self.releaseId = releaseId
         self.kind = kind
@@ -88,6 +99,7 @@ public struct NPRemotePackage {
         self.isMandatory = isMandatory
         self.description = description
         self.downloadObjectKey = downloadObjectKey
+        self.delta = delta
     }
 }
 
