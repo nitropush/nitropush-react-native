@@ -26,3 +26,6 @@ yarn workspace @nitropush/expo-example android
 
 Point the demo at a different environment by editing the
 `@nitropush/react-native` plugin config in `app.json` and re-running prebuild.
+For signed projects, include the full `bundlePublicKey` and set
+`requireBundleSigning: true` so prebuild fails instead of shipping a binary
+without the device trust root.

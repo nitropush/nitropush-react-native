@@ -4,7 +4,6 @@ import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
 import com.facebook.react.defaults.DefaultReactActivityDelegate
-import com.nitropush.sdk.NitroPushSdk
 
 class MainActivity : ReactActivity() {
 
@@ -20,15 +19,4 @@ class MainActivity : ReactActivity() {
    */
   override fun createReactActivityDelegate(): ReactActivityDelegate =
       DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
-
-  /**
-   * Confirms the running bundle is healthy on every resume. Idempotent —
-   * the SDK dedups internally, so calling this on every onResume is safe.
-   * Without this, the next launch would treat fresh installs as failed and
-   * roll them back. We do it natively so JS never has to know.
-   */
-  override fun onResume() {
-    super.onResume()
-    NitroPushSdk.shared.notifyAppReady()
-  }
 }

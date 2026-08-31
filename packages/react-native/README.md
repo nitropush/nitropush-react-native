@@ -57,6 +57,10 @@ Add your deployment key (and any optional overrides) as `<meta-data>` inside `<a
   <meta-data android:name="NITROPUSH_STORAGE_BASE_URL"
              android:value="https://cdn.nitropush.org" />
 
+  <!-- Required when bundle signing is enabled for the project -->
+  <meta-data android:name="NITROPUSH_BUNDLE_PUBLIC_KEY"
+             android:value="BASE64_DER_PUBLIC_KEY" />
+
 </application>
 ```
 
@@ -92,6 +96,10 @@ Add your deployment key to `Info.plist`:
 
 <key>NITROPUSH_STORAGE_BASE_URL</key>
 <string>https://cdn.nitropush.org</string>
+
+<!-- Required when bundle signing is enabled for the project -->
+<key>NITROPUSH_BUNDLE_PUBLIC_KEY</key>
+<string>BASE64_DER_PUBLIC_KEY</string>
 ```
 
 > All plist / manifest keys and their defaults are documented at [docs.nitropush.org/native-setup](https://docs.nitropush.org/native-setup).
@@ -110,6 +118,8 @@ const client = configure();
 
 export default function App() {
   useEffect(() => {
+    // Health confirmation belongs here, after React rendered. Never move
+    // this to applicationDidBecomeActive/onResume on the native side.
     client.notifyAppReady();
     sync(client, { installMode: InstallMode.ON_NEXT_RESUME }, (status) => {
       if (status === SyncStatus.UPDATE_INSTALLED) {

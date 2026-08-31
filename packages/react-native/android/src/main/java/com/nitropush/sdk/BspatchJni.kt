@@ -16,6 +16,6 @@ internal object BspatchJni {
     external fun patch(basePath: String, patchPath: String, outPath: String): Int
 
     init {
-        System.loadLibrary("nitropush")
+        System.loadLibrary("NitroPush")
     }
 }

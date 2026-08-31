@@ -22,10 +22,38 @@ import java.net.URL
 import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.Signature
+import java.security.interfaces.ECPublicKey
 import java.security.spec.X509EncodedKeySpec
 import java.text.Normalizer
 import java.util.Locale
 import java.util.UUID
+
+private val RELEASE_ID_REGEX = Regex(
+    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+)
+
+private fun validateReleaseId(releaseId: String) {
+    validateCanonicalUuid(releaseId, "releaseId")
+}
+
+private fun validateCanonicalUuid(value: String, fieldName: String) {
+    check(RELEASE_ID_REGEX.matches(value)) { "$fieldName is not a lowercase canonical UUID" }
+}
+
+private fun releaseRoot(context: Context): File =
+    File(context.filesDir, "nitropush").also { root ->
+        check(root.exists() || root.mkdirs()) { "could not create the NitroPush update directory" }
+    }.canonicalFile
+
+private fun releaseDirectory(context: Context, releaseId: String): File {
+    validateReleaseId(releaseId)
+    val root = releaseRoot(context)
+    val directory = File(root, releaseId).canonicalFile
+    check(directory.parentFile?.canonicalFile == root && directory.name == releaseId) {
+        "release directory escapes the update root"
+    }
+    return directory
+}
 
 /**
  * Plain Android implementation of the NitroPush OTA core.
@@ -156,6 +184,7 @@ class NitroPushSdk private constructor(
 
     private var serverUrl: String? = null
     private var deploymentKey: String? = null
+    private var deploymentKeyHash: String? = null
     /** Public base URL for bundle/asset storage. No trailing slash. */
     private var storageBaseUrl: String? = null
     private var appVersion: String? = null
@@ -195,6 +224,7 @@ class NitroPushSdk private constructor(
 
     /** releaseId → pre-signed manifest proxy URL from the server. */
     private val manifestUrlOverride = mutableMapOf<String, String>()
+    private val manifestDeploymentKeyHash = mutableMapOf<String, String>()
 
     private var pendingResume: Pair<NPLocalPackage, Long>? = null
     private var pendingSuspend: NPLocalPackage? = null
@@ -220,30 +250,45 @@ class NitroPushSdk private constructor(
     private val reportedFirstRuns = mutableSetOf<String>()
 
     private val releaseFilesManifestName = ".nitropush-files.json"
+    private val maxLatestResponseBytes = 512 * 1024
+    private val maxManifestBytes = 2 * 1024 * 1024
+    private val maxBundleBytes = 64L * 1024L * 1024L
+    private val maxAssetBytes = 16L * 1024L * 1024L
+    private val maxReleaseBytes = 128L * 1024L * 1024L
     private val maxCacheBytes = 50L * 1024L * 1024L
     private val targetCacheBytesAfterPrune = 40L * 1024L * 1024L
     private val maxUnprotectedCacheAgeMs = 14L * 24L * 60L * 60L * 1000L
 
     fun configure(config: NPConfig) {
         log("configure") {
-            "serverUrl=${config.serverUrl} deploymentKey=${config.deploymentKey.take(20)}… " +
-                "storageBaseUrl=${config.storageBaseUrl} appVersion=${config.appVersion ?: "(auto)"}"
+            "serverUrl=${redactedUrl(config.serverUrl)} " +
+                "storageBaseUrl=${redactedUrl(config.storageBaseUrl)} " +
+                "appVersion=${config.appVersion ?: "(auto)"}"
         }
-        serverUrl = config.serverUrl.trimEnd('/')
-        deploymentKey = config.deploymentKey
-        val storage = config.storageBaseUrl.trim()
-        require(storage.isNotEmpty()) { "storageBaseUrl is required" }
-        storageBaseUrl = storage.trimEnd('/')
+        val apiUrl = validatedNetworkUrl(config.serverUrl, "serverUrl")
+        val storageUrl = validatedNetworkUrl(config.storageBaseUrl, "storageBaseUrl")
+        require(config.deploymentKey.isNotBlank()) { "deploymentKey is required" }
+        val validatedPublicKey = config.bundlePublicKey?.trim()?.takeIf { it.isNotEmpty() }?.also {
+            parseBundlePublicKey(it)
+        }
+        serverUrl = apiUrl.toString().trimEnd('/')
+        deploymentKey = config.deploymentKey.trim()
+        deploymentKeyHash = sha256Hex(config.deploymentKey.trim().toByteArray(Charsets.UTF_8))
+        storageBaseUrl = storageUrl.toString().trimEnd('/')
         appVersion = config.appVersion ?: binaryAppVersion()
         clientUniqueId = config.clientUniqueId ?: fallbackDeviceId()
         val tokenScopeHash = MessageDigest.getInstance("SHA-256")
-            .digest("${serverUrl}\u0000${config.deploymentKey}".toByteArray(Charsets.UTF_8))
+            .digest("${serverUrl}\u0000${deploymentKey}".toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
         val tokenKey = "nitropush.deviceToken.$tokenScopeHash"
         deviceTokenStorageKey = tokenKey
         deviceToken = prefs.getString(tokenKey, null)
-        bundlePublicKey = config.bundlePublicKey
+        bundlePublicKey = validatedPublicKey
         enableDeltaUpdates = config.enableDeltaUpdates
+        // Pre-signed URLs are scoped to the response that created them and
+        // must never survive a server/project reconfiguration.
+        manifestUrlOverride.clear()
+        manifestDeploymentKeyHash.clear()
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
@@ -251,6 +296,7 @@ class NitroPushSdk private constructor(
         analytics = NPAnalytics(
             serverUrl = config.serverUrl,
             deploymentKey = config.deploymentKey,
+            deviceToken = deviceToken,
         )
 
         emit(type = "app_started")
@@ -261,12 +307,120 @@ class NitroPushSdk private constructor(
         pruneUnusedBundlesAndCache()
     }
 
+    private fun isLoopback(host: String?): Boolean = when (host?.lowercase(Locale.ROOT)) {
+        "localhost", "127.0.0.1", "::1", "[::1]" -> true
+        else -> false
+    }
+
+    private fun validatedNetworkUrl(raw: String, name: String, allowQuery: Boolean = false): URL {
+        val url = runCatching { URL(raw.trim()) }.getOrElse {
+            error("$name must be an absolute HTTPS URL")
+        }
+        check(url.userInfo == null && (allowQuery || url.query == null) &&
+            url.ref == null && url.host.isNotEmpty()) {
+            "$name must not contain credentials, a query, or a fragment"
+        }
+        check(url.protocol.equals("https", ignoreCase = true) ||
+            (url.protocol.equals("http", ignoreCase = true) && isLoopback(url.host))) {
+            "$name must use HTTPS (HTTP is allowed only for loopback development)"
+        }
+        return url
+    }
+
+    private fun effectivePort(url: URL): Int = when {
+        url.port >= 0 -> url.port
+        url.protocol.equals("https", ignoreCase = true) -> 443
+        else -> 80
+    }
+
+    private fun sameOrigin(left: URL, right: URL): Boolean =
+        left.protocol.equals(right.protocol, ignoreCase = true) &&
+            left.host.equals(right.host, ignoreCase = true) &&
+            effectivePort(left) == effectivePort(right)
+
+    private fun redactedUrl(raw: String): String = runCatching {
+        val url = URL(raw)
+        URL(url.protocol, url.host, url.port, url.path).toString()
+    }.getOrDefault("<invalid-url>")
+
+    private fun parseBundlePublicKey(publicKeyBase64: String): ECPublicKey {
+        check(Regex("^[A-Za-z0-9+/]+={0,2}$").matches(publicKeyBase64) &&
+            publicKeyBase64.length % 4 == 0) {
+            "bundlePublicKey is not canonical base64 DER"
+        }
+        val decoded = try {
+            Base64.decode(publicKeyBase64, Base64.DEFAULT)
+        } catch (_: Throwable) {
+            error("bundlePublicKey is not valid base64 DER")
+        }
+        check(Base64.encodeToString(decoded, Base64.NO_WRAP) == publicKeyBase64) {
+            "bundlePublicKey is not canonical base64 DER"
+        }
+        val key = try {
+            KeyFactory.getInstance("EC")
+                .generatePublic(X509EncodedKeySpec(decoded)) as? ECPublicKey
+        } catch (_: Throwable) {
+            null
+        } ?: error("bundlePublicKey is not a valid P-256 SPKI public key")
+        check(key.params.curve.field.fieldSize == 256) {
+            "bundlePublicKey must use the P-256 curve"
+        }
+        return key
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { "%02x".format(it) }
+
+    private fun openConnection(
+        url: URL,
+        includeDeviceToken: Boolean = false,
+        readTimeoutMs: Int = 60_000,
+    ): HttpURLConnection {
+        val validated = validatedNetworkUrl(url.toString(), "request URL", allowQuery = true)
+        val connection = validated.openConnection() as HttpURLConnection
+        connection.instanceFollowRedirects = false
+        connection.connectTimeout = 60_000
+        connection.readTimeout = readTimeoutMs
+        if (includeDeviceToken) {
+            val api = serverUrl?.let(::URL) ?: error("NitroPushSdk.configure(...) was not called.")
+            check(sameOrigin(validated, api)) { "refusing to send device proof to a different origin" }
+            deviceToken?.let { connection.setRequestProperty("x-nitropush-device-token", it) }
+        }
+        return connection
+    }
+
+    private fun readBounded(input: java.io.InputStream, maximumBytes: Int): ByteArray {
+        input.use { stream ->
+            val output = ByteArrayOutputStream(minOf(maximumBytes, 64 * 1024))
+            val buffer = ByteArray(16 * 1024)
+            var total = 0
+            while (true) {
+                val count = stream.read(buffer)
+                if (count == -1) break
+                total += count
+                check(total <= maximumBytes) { "response exceeds the allowed size" }
+                output.write(buffer, 0, count)
+            }
+            return output.toByteArray()
+        }
+    }
+
     /** Resolve a bucket-relative `objectKey` to an absolute URL. */
     private fun resolveObjectUrl(objectKey: String): String {
         val base = storageBaseUrl
             ?: error("NitroPushSdk.configure(...) was not called.")
+        val segments = objectKey.split("/")
+        check(objectKey.isNotEmpty() &&
+            !objectKey.startsWith("//") &&
+            !objectKey.contains('?') &&
+            !objectKey.contains('#') &&
+            objectKey.none { it.code < 0x20 || it.code == 0x7f } &&
+            segments.none { it == "." || it == ".." }) {
+            "unsafe storage object key"
+        }
         val key = if (objectKey.startsWith("/")) objectKey.substring(1) else objectKey
-        return "$base/$key"
+        return validatedNetworkUrl("$base/$key", "download URL").toString()
     }
 
     /** Blocking. Run on a worker thread (the Nitro bridge uses Promise.async). */
@@ -483,6 +637,7 @@ class NitroPushSdk private constructor(
         val a = analytics ?: return
         a.enqueue(
             NPAnalyticsEvent(
+                eventId = UUID.randomUUID().toString(),
                 eventType = type,
                 clientUniqueId = clientUniqueId ?: fallbackDeviceId(),
                 appVersion = appVersion ?: this.appVersion ?: "*",
@@ -537,7 +692,13 @@ class NitroPushSdk private constructor(
      */
     fun activeBundleFile(): String? {
         val active = readActive() ?: return null
-        val file = File(active.bundlePath)
+        val releaseDir = runCatching { releaseDirectory(applicationContext, active.releaseId) }
+            .getOrNull() ?: return null
+        val file = File(active.bundlePath).canonicalFile
+        if (!file.path.startsWith(releaseDir.path + File.separator)) {
+            log("activeBundleFile → skipped") { "stored bundle path escapes its release directory" }
+            return null
+        }
         if (!file.exists()) return null
         if (!isHermesBundle(file)) {
             log("activeBundleFile → skipped") {
@@ -639,10 +800,10 @@ class NitroPushSdk private constructor(
 
     private fun requestLatestRelease(deploymentKey: String?): NPRemotePackage? {
         val server = serverUrl ?: error("NitroPushSdk.configure(...) was not called.")
-        val key = deploymentKey ?: error("deploymentKey not set")
+        val key = deploymentKey?.trim()?.takeIf { it.isNotEmpty() }
+            ?: error("deploymentKey not set")
 
         val params = mutableMapOf(
-            "deploymentKey" to key,
             "platform" to "android",
         )
         appVersion?.let { params["appVersion"] = it }
@@ -658,14 +819,16 @@ class NitroPushSdk private constructor(
         val query = params.entries.joinToString("&") {
             "${Uri.encode(it.key)}=${Uri.encode(it.value)}"
         }
-        val url = URL("$server/api/sdk/releases/latest?$query")
-        log("checkForUpdate") { "GET $url" }
+        val url = validatedNetworkUrl(
+            "$server/api/sdk/releases/latest?$query",
+            "latest-release URL",
+            allowQuery = true,
+        )
+        log("checkForUpdate") { "GET ${redactedUrl(url.toString())}" }
 
-        val conn = (url.openConnection() as HttpURLConnection).apply {
+        val conn = openConnection(url, includeDeviceToken = true).apply {
             requestMethod = "GET"
-            connectTimeout = 60_000
-            readTimeout = 60_000
-            deviceToken?.let { setRequestProperty("x-nitropush-device-token", it) }
+            setRequestProperty("x-nitropush-deployment-key", key)
         }
         try {
             val code = conn.responseCode
@@ -674,33 +837,33 @@ class NitroPushSdk private constructor(
                 ?.let { issuedToken ->
                     deviceToken = issuedToken
                     deviceTokenStorageKey?.let { prefs.edit().putString(it, issuedToken).apply() }
+                    analytics?.setDeviceToken(issuedToken)
                 }
             if (code == 204) return null
             if (code !in 200..299) {
-                val errBody = runCatching {
-                    (conn.errorStream ?: conn.inputStream)?.bufferedReader()?.use { it.readText() }
-                }.getOrNull() ?: ""
                 error(
                     describeFetchFailure(
                         url = url.toString(),
-                        body = errBody,
                         reason = "checkForUpdate non-2xx HTTP $code",
                         contentType = conn.contentType,
                     )
                 )
             }
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            if (conn.contentLengthLong > maxLatestResponseBytes) {
+                error("latest-release response exceeds the allowed size")
+            }
+            val bodyBytes = readBounded(conn.inputStream, maxLatestResponseBytes)
+            val body = bodyBytes.toString(Charsets.UTF_8)
             val root = try {
                 JSONObject(body)
-            } catch (e: Throwable) {
+            } catch (_: Throwable) {
                 throw IllegalStateException(
                     describeFetchFailure(
                         url = url.toString(),
-                        body = body,
-                        reason = "checkForUpdate JSON parse failed: ${e.message}",
+                        reason = "checkForUpdate JSON parse failed",
                         contentType = conn.contentType,
+                        responseBytes = bodyBytes.size,
                     ),
-                    e,
                 )
             }
             if (root.isNull("release")) return null
@@ -738,13 +901,35 @@ class NitroPushSdk private constructor(
                     )
                 } else null,
             )
+            validateReleaseId(pkg.releaseId)
+            manifestDeploymentKeyHash[pkg.releaseId] =
+                sha256Hex(key.toByteArray(Charsets.UTF_8))
+            check(pkg.kind == "expo" || pkg.kind == "codepush") { "unsupported release kind" }
+            check(pkg.packageSize.isFinite() && pkg.packageSize > 0 && pkg.packageSize <= maxBundleBytes) {
+                "release package size is invalid"
+            }
+            check(Regex("^[a-f0-9]{64}$").matches(pkg.packageHash)) {
+                "release package hash is invalid"
+            }
+            if (pkg.appVersion != "*" && appVersion != null) {
+                check(pkg.appVersion == appVersion) { "release runtime does not match this binary" }
+            }
+            val activeVersion = active?.otaVersion
+            if (active != null && active.appVersion == pkg.appVersion &&
+                activeVersion != null && pkg.otaVersion != null &&
+                pkg.otaVersion <= activeVersion && active.releaseId != pkg.releaseId
+            ) {
+                error("refusing a non-monotonic OTA release")
+            }
             // Cache the pre-signed manifest proxy URL for use in downloadManifestRelease.
             r.optString("downloadUrl").takeIf { it.isNotEmpty() }?.let {
-                manifestUrlOverride[pkg.releaseId] = if (it.startsWith("http://") || it.startsWith("https://")) {
+                val resolved = if (it.startsWith("http://") || it.startsWith("https://")) {
                     it
                 } else {
                     "${server.trimEnd('/')}/${it.trimStart('/')}"
                 }
+                manifestUrlOverride[pkg.releaseId] =
+                    validatedNetworkUrl(resolved, "manifest download URL", allowQuery = true).toString()
             }
             return pkg
         } finally {
@@ -753,9 +938,9 @@ class NitroPushSdk private constructor(
     }
 
     private fun performDownload(pkg: NPRemotePackage): NPLocalPackage {
-        val releaseDir = File(applicationContext.filesDir, "nitropush/${pkg.releaseId}")
+        val releaseDir = releaseDirectory(applicationContext, pkg.releaseId)
         if (releaseDir.exists()) releaseDir.deleteRecursively()
-        releaseDir.mkdirs()
+        check(releaseDir.mkdirs()) { "could not create release staging directory" }
 
         // Both kinds (`expo` and `codepush`) ship a manifest at
         // `pkg.downloadObjectKey`. The manifest layout is identical across
@@ -843,33 +1028,104 @@ class NitroPushSdk private constructor(
         }
     }
 
+    /** Canonical schema-4 envelope. See the matching CLI signer. */
+    private fun releaseIntegrityPayload(manifest: JSONObject): String {
+        val releaseId = manifest.getString("releaseId")
+        val projectId = manifest.getString("projectId")
+        val environment = manifest.getString("environment")
+        val signedDeploymentKeyHash = manifest.getString("deploymentKeyHash")
+        val kind = manifest.getString("kind")
+        val targetAppVersion = manifest.getString("targetAppVersion")
+        val label = manifest.getString("label")
+        val otaVersion = manifest.getDouble("otaVersion")
+        check(otaVersion.isFinite() && otaVersion > 0 && otaVersion % 1.0 == 0.0 &&
+            otaVersion <= Long.MAX_VALUE.toDouble()) {
+            "signed release otaVersion is invalid"
+        }
+        check(manifest.has("isMandatory")) { "signed release mandatory flag is missing" }
+        val isMandatory = manifest.getBoolean("isMandatory")
+        validateReleaseId(releaseId)
+        validateCanonicalUuid(projectId, "projectId")
+        check(Regex("^[a-f0-9]{64}$").matches(signedDeploymentKeyHash)) {
+            "signed deployment key hash is invalid"
+        }
+
+        val platformArray = manifest.getJSONArray("platforms")
+        val platforms = List(platformArray.length()) { platformArray.getString(it) }.sorted()
+        check(platforms.isNotEmpty() && platforms.toSet().size == platforms.size &&
+            platforms.all { it == "ios" || it == "android" }) {
+            "signed release platforms are invalid"
+        }
+        fun field(name: String, value: String): String =
+            "$name:${value.toByteArray(Charsets.UTF_8).size}:$value\n"
+        fun artifact(type: String, entry: JSONObject): String {
+            check(entry.has("size")) { "signed release artifact is missing size" }
+            val path = entry.getString("originalPath")
+            return "$type:${path.toByteArray(Charsets.UTF_8).size}:$path:" +
+                "${entry.getString("sha256")}:${entry.getLong("size")}\n"
+        }
+        val bundle = manifest.getJSONObject("bundle")
+        val assets = manifest.optJSONArray("assets") ?: org.json.JSONArray()
+        return buildString {
+            append("nitropush-release-v2\n")
+            append(field("releaseId", releaseId.lowercase(Locale.ROOT)))
+            append(field("projectId", projectId.lowercase(Locale.ROOT)))
+            append(field("environment", environment))
+            append(field("deploymentKeyHash", signedDeploymentKeyHash.lowercase(Locale.ROOT)))
+            append(field("kind", kind))
+            append("platforms:${platforms.size}\n")
+            platforms.forEach { append(field("platform", it)) }
+            append(field("runtimeVersion", targetAppVersion))
+            append(field("label", label))
+            append("otaVersion:${otaVersion.toLong()}\n")
+            append("mandatory:${if (isMandatory) 1 else 0}\n")
+            append(artifact("bundle", bundle))
+            append("assets:${assets.length()}\n")
+            for (i in 0 until assets.length()) append(artifact("asset", assets.getJSONObject(i)))
+        }
+    }
+
+    private fun validateSignedContext(manifest: JSONObject, pkg: NPRemotePackage) {
+        val expectedDeploymentHash = manifestDeploymentKeyHash[pkg.releaseId] ?: deploymentKeyHash
+        val manifestPlatforms = manifest.getJSONArray("platforms").let { array ->
+            List(array.length()) { array.getString(it) }.toSet()
+        }
+        check(manifest.getString("releaseId").equals(pkg.releaseId, ignoreCase = true) &&
+            manifest.getString("kind") == pkg.kind &&
+            manifest.getString("label") == pkg.label &&
+            manifest.getString("targetAppVersion") == pkg.appVersion &&
+            manifest.getDouble("otaVersion") == pkg.otaVersion &&
+            manifest.getBoolean("isMandatory") == pkg.isMandatory &&
+            manifestPlatforms == (pkg.platforms?.toSet() ?: emptySet<String>()) &&
+            manifest.getString("deploymentKeyHash").lowercase(Locale.ROOT) == expectedDeploymentHash &&
+            manifest.getJSONObject("bundle").getString("sha256") == pkg.packageHash.lowercase(Locale.ROOT)) {
+            "latest-release metadata does not match the signed release envelope"
+        }
+        check("android" in manifestPlatforms) { "signed release does not target Android" }
+    }
+
     private fun downloadManifestRelease(pkg: NPRemotePackage, releaseDir: File): String {
         val manifestUrl = manifestUrlOverride[pkg.releaseId]
             ?: resolveObjectUrl(pkg.downloadObjectKey)
-        log("downloadManifestRelease") { "GET $manifestUrl" }
+        log("downloadManifestRelease") { "GET ${redactedUrl(manifestUrl)}" }
         val manifestText = httpGetString(manifestUrl)
         check(manifestText.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024) {
             "release manifest exceeds the allowed size"
         }
         val manifest = try {
             JSONObject(manifestText)
-        } catch (e: Throwable) {
-            // Most common cause: the server returned an HTML error page or
-            // an S3/MinIO XML envelope with a 200 status. Surface URL + body
-            // snippet so the failure is self-diagnosing instead of just
-            // "Value <... of type String cannot be converted to JSONObject".
+        } catch (_: Throwable) {
             throw IllegalStateException(
                 describeFetchFailure(
                     url = manifestUrl,
-                    body = manifestText,
-                    reason = "JSON parse failed: ${e.message}",
+                    reason = "JSON parse failed",
+                    responseBytes = manifestText.toByteArray(Charsets.UTF_8).size,
                 ),
-                e,
             )
         }
 
         val schemaVersion = manifest.optInt("schemaVersion", 2)
-        check(schemaVersion == 2 || schemaVersion == 3) {
+        check(schemaVersion == 2 || schemaVersion == 3 || schemaVersion == 4) {
             "unsupported release manifest schema $schemaVersion"
         }
         val bundleObj = manifest.getJSONObject("bundle")
@@ -909,21 +1165,22 @@ class NitroPushSdk private constructor(
         check(totalBytes <= 128L * 1024L * 1024L) { "release content exceeds the allowed size" }
 
         bundlePublicKey?.let { pubKey ->
-            check(schemaVersion == 3) {
-                "signed projects require manifest schema 3; refusing legacy downgrade"
+            check(schemaVersion == 4) {
+                "signed projects require manifest schema 4; refusing legacy/context downgrade"
             }
+            validateSignedContext(manifest, pkg)
             check(bundleSignature != null) {
                 "bundle is unsigned but a bundlePublicKey is configured — refusing to install"
             }
             verifyBundleSignature(bundleSha256, bundleSignature, pubKey)
-            val integritySignature = manifest.optString("integritySignature")
+            val releaseSignature = manifest.optString("releaseSignature")
                 .takeIf { it.isNotEmpty() }
-                ?: error("signed manifest is missing its integrity signature")
+                ?: error("signed manifest is missing its release envelope signature")
             verifySignature(
-                manifestIntegrityPayload(manifest),
-                integritySignature,
+                releaseIntegrityPayload(manifest),
+                releaseSignature,
                 pubKey,
-                "release manifest",
+                "release envelope",
             )
         }
 
@@ -946,7 +1203,7 @@ class NitroPushSdk private constructor(
             activeBundleHash == selectedDelta.fromBundleHash
 
         var usedDelta = false
-        if (canUseDelta && selectedDelta != null) {
+        if (canUseDelta) {
             try {
                 applyDeltaPatch(
                     patchObjectKey = selectedDelta.patchObjectKey,
@@ -984,11 +1241,21 @@ class NitroPushSdk private constructor(
             }
         }
 
+        var installedBytes = 0L
         if (!usedDelta) {
             val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(bundleObjectKey)
-            fetchByContentHash(bundleDownloadUrl, bundleSha256, bundleDest, bundleSize.toLong())
+            installedBytes += fetchByContentHash(
+                bundleDownloadUrl,
+                bundleSha256,
+                bundleDest,
+                bundleSize.toLong(),
+                maxBundleBytes,
+            )
+        } else {
+            installedBytes += bundleDest.length()
         }
+        check(installedBytes <= maxReleaseBytes) { "release content exceeds the allowed size" }
 
         val cachedHashes = mutableSetOf(bundleSha256)
         val total = assets.length()
@@ -1000,7 +1267,14 @@ class NitroPushSdk private constructor(
             val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(objectKey)
             val dest = assetDestinations[i].also { it.parentFile?.mkdirs() }
-            fetchByContentHash(assetDownloadUrl, sha256, dest, size)
+            installedBytes += fetchByContentHash(
+                assetDownloadUrl,
+                sha256,
+                dest,
+                size,
+                maxAssetBytes,
+            )
+            check(installedBytes <= maxReleaseBytes) { "release content exceeds the allowed size" }
             cachedHashes.add(sha256)
 
             // Coarse progress in the absence of byte totals: 1 unit per asset.
@@ -1026,20 +1300,35 @@ class NitroPushSdk private constructor(
      * is kept at `nitropush/cache/<hash>`. If present, hardlink/copy to
      * `dest` and skip the network. Otherwise download, verify, copy.
      */
-    private fun fetchByContentHash(url: String, sha256: String, dest: File, announcedSize: Long) {
+    private fun fetchByContentHash(
+        url: String,
+        sha256: String,
+        dest: File,
+        announcedSize: Long,
+        maximumBytes: Long,
+    ): Long {
         val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
         val cached = File(cache, sha256)
         if (cached.exists()) {
-            if (sha256Hex(cached) != sha256 || (announcedSize > 0 && cached.length() != announcedSize)) {
+            if (sha256Hex(cached) != sha256 || cached.length() <= 0 || cached.length() > maximumBytes ||
+                (announcedSize > 0 && cached.length() != announcedSize)) {
                 cached.delete()
             } else {
                 cached.setLastModified(System.currentTimeMillis())
                 cached.copyTo(dest, overwrite = true)
-                return
+                return dest.length()
             }
         }
-        downloadToFile(url, cached, expectedSha256 = sha256, announcedSize = announcedSize)
+        downloadToFile(
+            url,
+            cached,
+            expectedSha256 = sha256,
+            announcedSize = announcedSize,
+            maximumBytes = maximumBytes,
+        )
         cached.copyTo(dest, overwrite = true)
+        check(dest.length() in 1..maximumBytes) { "download exceeds the allowed size" }
+        return dest.length()
     }
 
     private fun sha256Hex(file: File): String {
@@ -1077,7 +1366,13 @@ class NitroPushSdk private constructor(
         val patchUrl = resolveObjectUrl(patchObjectKey)
         val tmpPatch = File.createTempFile("nitropush-patch-", ".bsdiff", applicationContext.cacheDir)
         try {
-            downloadToFile(patchUrl, tmpPatch, expectedSha256 = patchSha256, announcedSize = patchSize.toLong())
+            downloadToFile(
+                patchUrl,
+                tmpPatch,
+                expectedSha256 = patchSha256,
+                announcedSize = patchSize.toLong(),
+                maximumBytes = maxBundleBytes,
+            )
 
             val rc = BspatchJni.patch(baseCached.absolutePath, tmpPatch.absolutePath, dest.absolutePath)
             check(rc == 0) { "bspatch failed with code $rc" }
@@ -1105,14 +1400,19 @@ class NitroPushSdk private constructor(
         dest: File,
         expectedSha256: String,
         announcedSize: Long,
+        maximumBytes: Long,
     ) {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 60_000
-            readTimeout = 5 * 60_000
-        }
+        val safeUrl = validatedNetworkUrl(url, "asset download URL", allowQuery = true)
+        val conn = openConnection(safeUrl, readTimeoutMs = 5 * 60_000)
         try {
             val code = conn.responseCode
-            if (code !in 200..299) error("downloadUpdate: HTTP $code from $url")
+            if (code !in 200..299) {
+                error("download returned HTTP $code from ${redactedUrl(url)}")
+            }
+            if (conn.contentLengthLong > maximumBytes ||
+                (announcedSize > 0 && conn.contentLengthLong > announcedSize)) {
+                error("download exceeds the allowed size")
+            }
 
             val md = MessageDigest.getInstance("SHA-256")
             conn.inputStream.use { input ->
@@ -1125,6 +1425,10 @@ class NitroPushSdk private constructor(
                         output.write(buf, 0, n)
                         md.update(buf, 0, n)
                         written += n
+                        if (written > maximumBytes) {
+                            dest.delete()
+                            error("download exceeds the allowed size")
+                        }
                         if (announcedSize > 0 && written > announcedSize) {
                             dest.delete()
                             error("download exceeded announced size of $announcedSize bytes")
@@ -1148,7 +1452,7 @@ class NitroPushSdk private constructor(
                 val actual = md.digest().joinToString("") { "%02x".format(it) }
                 if (!actual.equals(expectedSha256, ignoreCase = true)) {
                     dest.delete()
-                    error("integrity check failed for $url (expected $expectedSha256 got $actual)")
+                    error("download integrity check failed")
                 }
             }
         } finally {
@@ -1183,22 +1487,12 @@ class NitroPushSdk private constructor(
         publicKeyBase64: String,
         description: String,
     ) {
-        val pubKeyBytes = try {
-            Base64.decode(publicKeyBase64, Base64.DEFAULT)
-        } catch (e: Throwable) {
-            error("bundlePublicKey is not valid base64: ${e.message}")
-        }
         val sigBytes = try {
             Base64.decode(signatureBase64, Base64.DEFAULT)
         } catch (e: Throwable) {
             error("$description signature is not valid base64: ${e.message}")
         }
-        val publicKey = try {
-            KeyFactory.getInstance("EC")
-                .generatePublic(X509EncodedKeySpec(pubKeyBytes))
-        } catch (e: Throwable) {
-            error("bundlePublicKey parse failed: ${e.message}")
-        }
+        val publicKey = parseBundlePublicKey(publicKeyBase64)
         val valid = try {
             val sig = Signature.getInstance("SHA256withECDSA")
             sig.initVerify(publicKey)
@@ -1212,62 +1506,45 @@ class NitroPushSdk private constructor(
 
     /** GET → string. Used for the small Expo manifest fetch. */
     private fun httpGetString(url: String): String {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 60_000
-            readTimeout = 60_000
-            deviceToken?.let { setRequestProperty("x-nitropush-device-token", it) }
-        }
+        val parsed = validatedNetworkUrl(url, "manifest download URL", allowQuery = true)
+        val api = serverUrl?.let { URL(it) }
+        val conn = openConnection(
+            parsed,
+            includeDeviceToken = api != null && sameOrigin(parsed, api),
+        )
         try {
             val code = conn.responseCode
             if (code !in 200..299) {
-                val body = runCatching {
-                    (conn.errorStream ?: conn.inputStream)?.bufferedReader()?.use { it.readText() }
-                }.getOrNull() ?: ""
                 error(
                     describeFetchFailure(
                         url = url,
-                        body = body,
                         reason = "non-2xx HTTP $code",
                         contentType = conn.contentType,
                     )
                 )
             }
-            return conn.inputStream.use { input ->
-                val output = ByteArrayOutputStream()
-                val buffer = ByteArray(16 * 1024)
-                var total = 0
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count == -1) break
-                    total += count
-                    check(total <= 2 * 1024 * 1024) { "release manifest exceeds the allowed size" }
-                    output.write(buffer, 0, count)
-                }
-                output.toString(Charsets.UTF_8.name())
+            check(conn.contentLengthLong <= maxManifestBytes) {
+                "release manifest exceeds the allowed size"
             }
+            return readBounded(conn.inputStream, maxManifestBytes).toString(Charsets.UTF_8)
         } finally {
             conn.disconnect()
         }
     }
 
     /**
-     * Build a self-diagnosing error string for an HTTP fetch that didn't
-     * produce the expected JSON. Includes the URL, optional content-type,
-     * and a 200-char body snippet so the failure tells the operator exactly
-     * what the server returned.
+     * Diagnostic that deliberately omits presigned query strings and body
+     * contents so errors can safely reach logcat/crash reporting.
      */
     private fun describeFetchFailure(
         url: String,
-        body: String,
         reason: String,
         contentType: String? = null,
+        responseBytes: Int? = null,
     ): String {
-        val snippet = if (body.length > 200) {
-            body.substring(0, 200) + "…(+${body.length - 200} more chars)"
-        } else body
-        return "$reason — url=$url" +
+        return "$reason — url=${redactedUrl(url)}" +
             (contentType?.let { " contentType=$it" } ?: "") +
-            " body=$snippet"
+            (responseBytes?.let { " responseBytes=$it" } ?: "")
     }
 
     private fun persistPending(pkg: NPLocalPackage) {
@@ -1285,17 +1562,22 @@ class NitroPushSdk private constructor(
         editor.apply()
     }
 
-    private fun readActive(): NPLocalPackage? =
+    private fun readActive(): NPLocalPackage? = runCatching {
         prefs.getString(Keys.ACTIVE, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
+    }.getOrNull()
 
-    private fun readPending(): NPLocalPackage? =
+    private fun readPending(): NPLocalPackage? = runCatching {
         prefs.getString(Keys.PENDING, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
+    }.getOrNull()
 
-    private fun readPrevious(): NPLocalPackage? =
+    private fun readPrevious(): NPLocalPackage? = runCatching {
         prefs.getString(Keys.PREVIOUS, null)?.let { NPLocalPackage.fromJson(JSONObject(it)) }
+    }.getOrNull()
 
     private fun deleteBundleDir(releaseId: String) {
-        File(applicationContext.filesDir, "nitropush/$releaseId").deleteRecursively()
+        runCatching { releaseDirectory(applicationContext, releaseId) }
+            .getOrNull()
+            ?.deleteRecursively()
     }
 
     private fun pruneUnusedBundlesAndCache() {
@@ -1304,7 +1586,7 @@ class NitroPushSdk private constructor(
         val protectedHashes = protectedPackages
             .flatMap { readReleaseFileHashes(it.releaseId) }
             .toSet()
-        val root = File(applicationContext.filesDir, "nitropush")
+        val root = releaseRoot(applicationContext)
 
         root.listFiles()?.forEach { entry ->
             if (!entry.isDirectory) return@forEach
@@ -1328,10 +1610,9 @@ class NitroPushSdk private constructor(
     }
 
     private fun readReleaseFileHashes(releaseId: String): List<String> {
-        val manifest = File(
-            File(applicationContext.filesDir, "nitropush/$releaseId"),
-            releaseFilesManifestName,
-        )
+        val releaseDir = runCatching { releaseDirectory(applicationContext, releaseId) }
+            .getOrNull() ?: return emptyList()
+        val manifest = File(releaseDir, releaseFilesManifestName)
         if (!manifest.exists()) return emptyList()
         return runCatching {
             val arr = JSONObject(manifest.readText()).optJSONArray("cachedHashes")
@@ -1431,12 +1712,14 @@ private fun NPLocalPackage.toJson(): JSONObject = JSONObject().apply {
 }
 
 private fun NPLocalPackage.Companion.fromJson(obj: JSONObject): NPLocalPackage {
+    val releaseId = obj.getString("releaseId")
+    validateReleaseId(releaseId)
     val platformsArr = obj.optJSONArray("platforms")
     val platforms = if (platformsArr != null) {
         Array(platformsArr.length()) { platformsArr.getString(it) }
     } else null
     return NPLocalPackage(
-        releaseId = obj.getString("releaseId"),
+        releaseId = releaseId,
         label = obj.getString("label"),
         packageHash = obj.getString("packageHash"),
         packageSize = obj.getDouble("packageSize"),

@@ -18,7 +18,7 @@ namespace margelo::nitro::nitropush {
   using namespace facebook;
 
   /**
-   * The C++ JNI bridge between the C++ struct "NitroPushConfig" and the the Kotlin data class "NitroPushConfig".
+   * The C++ JNI bridge between the C++ struct "NitroPushConfig" and the Kotlin data class "NitroPushConfig".
    */
   struct JNitroPushConfig final: public jni::JavaClass<JNitroPushConfig> {
   public:

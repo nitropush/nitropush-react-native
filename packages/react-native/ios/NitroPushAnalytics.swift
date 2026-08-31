@@ -22,6 +22,8 @@ struct NlEventMetadata: Codable {
 /// One JS-shaped analytics event. Wire matches the existing `/api/sdk/events`
 /// contract — moving from JS to native must not change the server schema.
 struct NlAnalyticsEvent: Codable {
+    /// Stable across retries so the server can make ingestion idempotent.
+    let eventId: String
     let eventType: String
     let clientUniqueId: String
     let appVersion: String
@@ -42,7 +44,7 @@ struct NlAnalyticsEvent: Codable {
 /// **Threading.** All queue mutation goes through `serial` so callers (the
 /// Nitro bridge, lifecycle observers, the rollback sweep) can hammer
 /// `enqueue` from any thread without locking.
-final class NlAnalytics {
+final class NlAnalytics: NSObject, URLSessionTaskDelegate {
     private let serverUrl: String
     private let deploymentKey: String
     private let capacity: Int
@@ -50,7 +52,17 @@ final class NlAnalytics {
     private let flushIntervalSeconds: TimeInterval
 
     private let serial = DispatchQueue(label: "com.nitropush.analytics", qos: .utility)
-    private let session: URLSession
+    private var deviceToken: String?
+    private lazy var session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 60
+        // Telemetry is best-effort and small; we don't want it riding on the
+        // device's metered foreground budget.
+        cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
+        return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    }()
 
     private var queue: [NlAnalyticsEvent] = []
     private var flushing = false
@@ -61,6 +73,7 @@ final class NlAnalytics {
     init(
         serverUrl: String,
         deploymentKey: String,
+        deviceToken: String?,
         capacity: Int = 200,
         flushAt: Int = 10,
         flushIntervalSeconds: TimeInterval = 30
@@ -69,18 +82,11 @@ final class NlAnalytics {
         // double-slash (some reverse proxies treat them as different paths).
         self.serverUrl = serverUrl.hasSuffix("/") ? String(serverUrl.dropLast()) : serverUrl
         self.deploymentKey = deploymentKey
+        self.deviceToken = deviceToken
         self.capacity = capacity
         self.flushAt = flushAt
         self.flushIntervalSeconds = flushIntervalSeconds
-
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 15
-        cfg.timeoutIntervalForResource = 60
-        // Telemetry is best-effort and small; we don't want it riding on the
-        // device's metered foreground budget.
-        cfg.allowsExpensiveNetworkAccess = true
-        cfg.allowsConstrainedNetworkAccess = true
-        self.session = URLSession(configuration: cfg)
+        super.init()
     }
 
     func enqueue(_ event: NlAnalyticsEvent) {
@@ -104,12 +110,31 @@ final class NlAnalytics {
         serial.async { [weak self] in self?.flushLocked() }
     }
 
+    /// Called when `/releases/latest` issues or rotates the origin-scoped
+    /// device proof. Queueing this on `serial` orders it before the next retry.
+    func setDeviceToken(_ token: String) {
+        serial.async { [weak self] in self?.deviceToken = token }
+    }
+
     func stop() {
         serial.async { [weak self] in
             self?.stopped = true
             self?.flushTimer?.cancel()
             self?.flushTimer = nil
+            self?.session.invalidateAndCancel()
         }
+    }
+
+    // Never forward the public deployment key or device proof to a redirect
+    // target. The main SDK transport has the same no-redirect rule.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 
     // MARK: - Private (must be called on `serial`)
@@ -141,6 +166,9 @@ final class NlAnalytics {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let deviceToken, !deviceToken.isEmpty {
+            req.setValue(deviceToken, forHTTPHeaderField: "x-nitropush-device-token")
+        }
 
         let body = Body(deploymentKey: deploymentKey, events: batch)
         do {

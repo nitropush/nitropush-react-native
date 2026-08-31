@@ -15,7 +15,7 @@ namespace margelo::nitro::nitropush {
   using namespace facebook;
 
   /**
-   * The C++ JNI bridge between the C++ enum "InstallMode" and the the Kotlin enum "InstallMode".
+   * The C++ JNI bridge between the C++ enum "InstallMode" and the Kotlin enum "InstallMode".
    */
   struct JInstallMode final: public jni::JavaClass<JInstallMode> {
   public:

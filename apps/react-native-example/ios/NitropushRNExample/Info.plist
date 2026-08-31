@@ -26,34 +26,14 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<!-- NitroPush SDK config read by NitroPushSdk.configFromInfoPlist().
-	     Use this when calling the no-arg `NitroPushSdk.shared.configure()`
-	     (or NitroPush.configure() from JS) instead of hardcoding values in
-	     AppDelegate. Port 9000 = MinIO S3 API; port 9001 = MinIO Console UI.
-	     Mirrors the Android `<meta-data NITROPUSH_*>` entries in AndroidManifest.xml. -->
+	<!-- Replace the deployment key before building. Signed projects must also
+	     add NITROPUSH_BUNDLE_PUBLIC_KEY with the full base64 DER P-256 key. -->
 	<key>NITROPUSH_SERVER_URL</key>
-	<string>http://192.168.0.141:3003</string>
+	<string>https://api.nitropush.org</string>
 	<key>NITROPUSH_DEPLOYMENT_KEY</key>
-	<string>nl_test_gLaFtFCoG6M6v3WrTCT8yConLA0onKfb1HxU7k8EoxI</string>
+	<string>REPLACE_WITH_DEPLOYMENT_KEY</string>
 	<key>NITROPUSH_STORAGE_BASE_URL</key>
-	<string>http://192.168.0.141:9000/nitrolift-bundles</string>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<false/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
-		<key>NSExceptionDomains</key>
-		<dict>
-			<key>192.168.0.141</key>
-			<dict>
-				<key>NSExceptionAllowsInsecureHTTPLoads</key>
-				<true/>
-				<key>NSIncludesSubdomains</key>
-				<false/>
-			</dict>
-		</dict>
-	</dict>
+	<string>https://cdn.nitropush.org</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string></string>
 	<key>RCTNewArchEnabled</key>

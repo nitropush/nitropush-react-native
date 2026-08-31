@@ -73,6 +73,7 @@ public final class NitroPushSdk {
 
     private var serverUrl: URL?
     private var deploymentKey: String?
+    private var deploymentKeyHash: String?
     /// Public base URL for bundle/asset storage. Joined with `objectKey`
     /// at fetch time. Trailing slash is stripped on store.
     private var storageBaseUrl: String?
@@ -104,11 +105,13 @@ public final class NitroPushSdk {
     /// Keyed by releaseId — pre-signed manifest proxy URL from the server.
     /// Populated in checkForUpdate; consumed by downloadManifestRelease.
     private var manifestUrlOverride: [String: String] = [:]
+    private var manifestDeploymentKeyHash: [String: String] = [:]
 
     private var pendingResumeAfterBackground: (NPLocalPackage, TimeInterval)?
     private var pendingSuspend: NPLocalPackage?
     private var lastBackgroundedAt: Date?
 
+    private let redirectDelegate: NoRedirectSessionDelegate
     private let session: URLSession
 
     /// Native analytics emitter. Replaces the deleted JS-side
@@ -123,6 +126,11 @@ public final class NitroPushSdk {
     private var reportedFirstRuns = Set<String>()
 
     private static let releaseFilesManifestName = ".nitropush-files.json"
+    private static let maxLatestResponseBytes = 512 * 1024
+    private static let maxManifestBytes = 2 * 1024 * 1024
+    private static let maxBundleBytes = 64 * 1024 * 1024
+    private static let maxAssetBytes = 16 * 1024 * 1024
+    private static let maxReleaseBytes = 128 * 1024 * 1024
     private static let maxCacheBytes = 50 * 1024 * 1024
     private static let targetCacheBytesAfterPrune = 40 * 1024 * 1024
     private static let maxUnprotectedCacheAgeSeconds: TimeInterval = 14 * 24 * 60 * 60
@@ -131,7 +139,16 @@ public final class NitroPushSdk {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 5 * 60
-        self.session = URLSession(configuration: cfg)
+        // Redirects are handled as errors. In particular, this prevents an
+        // API request carrying the long-lived device proof from being
+        // redirected to a different origin by a compromised proxy.
+        let redirectDelegate = NoRedirectSessionDelegate()
+        self.redirectDelegate = redirectDelegate
+        self.session = URLSession(
+            configuration: cfg,
+            delegate: redirectDelegate,
+            delegateQueue: nil
+        )
         // Note: we run the rollback sweep inside `consumePendingPointerOnLaunch`,
         // but can't emit events yet — `analytics` is `nil` until `configure()`.
         // The sweep stashes any rolled-back release id in `reportedRollbacks`
@@ -147,40 +164,67 @@ public final class NitroPushSdk {
 
     public func configure(_ config: NPConfig) throws {
         log("configure",
-            "serverUrl=\(config.serverUrl) deploymentKey=\(config.deploymentKey.prefix(20))… "
-            + "storageBaseUrl=\(config.storageBaseUrl) appVersion=\(config.appVersion ?? "(auto)")")
-        guard let url = URL(string: config.serverUrl) else {
-            throw NitroPushError.invalidConfig("serverUrl must be an absolute URL")
+            "serverUrl=\(Self.redactedURLString(config.serverUrl)) "
+            + "storageBaseUrl=\(Self.redactedURLString(config.storageBaseUrl)) "
+            + "appVersion=\(config.appVersion ?? "(auto)")")
+        let url = try Self.validatedNetworkURL(config.serverUrl, name: "serverUrl")
+        guard !config.deploymentKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NitroPushError.invalidConfig("deploymentKey is required")
         }
         let trimmedStorage = config.storageBaseUrl
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedStorage.isEmpty,
-              URL(string: trimmedStorage) != nil else {
-            throw NitroPushError.invalidConfig("storageBaseUrl must be an absolute URL")
+        let storageURL = try Self.validatedNetworkURL(trimmedStorage, name: "storageBaseUrl")
+        var validatedPublicKey: String?
+        if let rawPublicKey = config.bundlePublicKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawPublicKey.isEmpty {
+            guard rawPublicKey.range(
+                of: "^[A-Za-z0-9+/]+={0,2}$",
+                options: .regularExpression
+            ) != nil,
+            rawPublicKey.count % 4 == 0,
+            let keyData = Data(base64Encoded: rawPublicKey),
+            keyData.base64EncodedString() == rawPublicKey else {
+                throw NitroPushError.invalidConfig("bundlePublicKey is not valid base64 DER")
+            }
+            do {
+                _ = try P256.Signing.PublicKey(derRepresentation: keyData)
+            } catch {
+                throw NitroPushError.invalidConfig("bundlePublicKey is not a valid P-256 SPKI public key")
+            }
+            validatedPublicKey = rawPublicKey
         }
         self.serverUrl = url
-        self.deploymentKey = config.deploymentKey
+        self.deploymentKey = config.deploymentKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.deploymentKeyHash = Self.sha256Hex(
+            Data(self.deploymentKey!.utf8)
+        )
         // Keep one canonical form: no trailing slash. Joining helpers
         // always insert exactly one separator.
-        self.storageBaseUrl = trimmedStorage.hasSuffix("/")
-            ? String(trimmedStorage.dropLast())
-            : trimmedStorage
+        self.storageBaseUrl = storageURL.absoluteString.hasSuffix("/")
+            ? String(storageURL.absoluteString.dropLast())
+            : storageURL.absoluteString
         self.appVersion = config.appVersion ?? Self.binaryAppVersion()
         self.clientUniqueId = config.clientUniqueId ?? Self.fallbackDeviceId()
-        let tokenScope = Data("\(url.absoluteString)\u{0}\(config.deploymentKey)".utf8)
+        let tokenScope = Data("\(url.absoluteString)\u{0}\(self.deploymentKey!)".utf8)
         let tokenScopeHash = SHA256.hash(data: tokenScope)
             .map { String(format: "%02x", $0) }.joined()
         self.deviceTokenStorageKey = "nitropush.deviceToken.\(tokenScopeHash)"
         self.deviceToken = UserDefaults.standard.string(forKey: self.deviceTokenStorageKey!)
-        self.bundlePublicKey = config.bundlePublicKey
+        self.bundlePublicKey = validatedPublicKey
         self.enableDeltaUpdates = config.enableDeltaUpdates
+        // These URLs are scoped to the previous API response. Never reuse
+        // them after reconfiguration, even when a release id happens to
+        // collide across projects or environments.
+        self.manifestUrlOverride.removeAll()
+        self.manifestDeploymentKeyHash.removeAll()
 
         // Replace any prior emitter — re-configure can change endpoint
         // or deployment key, and the in-flight queue is no longer valid.
         self.analytics?.stop()
         self.analytics = NlAnalytics(
             serverUrl: config.serverUrl,
-            deploymentKey: config.deploymentKey
+            deploymentKey: config.deploymentKey,
+            deviceToken: self.deviceToken
         )
 
         emit(type: "app_started")
@@ -191,17 +235,150 @@ public final class NitroPushSdk {
         pruneUnusedBundlesAndCache()
     }
 
+    private static func isLoopbackHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    private static func validatedNetworkURL(
+        _ raw: String,
+        name: String,
+        allowQuery: Bool = false
+    ) throws -> URL {
+        guard let url = URL(string: raw),
+              url.baseURL == nil,
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil,
+              (allowQuery || url.query == nil),
+              url.fragment == nil,
+              scheme == "https" || (scheme == "http" && isLoopbackHost(host)) else {
+            throw NitroPushError.invalidConfig(
+                "\(name) must be an absolute HTTPS URL (HTTP is allowed only for loopback development)"
+            )
+        }
+        return url
+    }
+
+    private static func effectivePort(_ url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+
+    private static func sameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.scheme?.lowercased() == rhs.scheme?.lowercased()
+            && lhs.host?.lowercased() == rhs.host?.lowercased()
+            && effectivePort(lhs) == effectivePort(rhs)
+    }
+
+    private static func redactedURL(_ url: URL) -> String {
+        var components = URLComponents()
+        components.scheme = url.scheme
+        components.host = url.host
+        components.port = url.port
+        components.path = url.path
+        return components.string ?? "<redacted-url>"
+    }
+
+    private static func redactedURLString(_ raw: String) -> String {
+        guard let url = URL(string: raw) else { return "<invalid-url>" }
+        return redactedURL(url)
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func requestForAPIURL(
+        _ url: URL,
+        deploymentKey: String? = nil
+    ) throws -> URLRequest {
+        guard let api = serverUrl,
+              Self.sameOrigin(url, api),
+              url.scheme?.lowercased() == api.scheme?.lowercased() else {
+            throw NitroPushError.networkFailure("refusing API request to a different origin")
+        }
+        var request = URLRequest(url: url)
+        if let deviceToken {
+            request.setValue(deviceToken, forHTTPHeaderField: "x-nitropush-device-token")
+        }
+        if let deploymentKey {
+            request.setValue(deploymentKey, forHTTPHeaderField: "x-nitropush-deployment-key")
+        }
+        return request
+    }
+
+    private func data(
+        for request: URLRequest,
+        maximumBytes: Int
+    ) async throws -> (Data, URLResponse) {
+        let (bytes, response) = try await session.bytes(for: request)
+        if response.expectedContentLength > Int64(maximumBytes) {
+            throw NitroPushError.integrityFailure("response exceeds the allowed size")
+        }
+        var result = Data()
+        result.reserveCapacity(min(maximumBytes, max(0, Int(response.expectedContentLength))))
+        for try await byte in bytes {
+            guard result.count < maximumBytes else {
+                throw NitroPushError.integrityFailure("response exceeds the allowed size")
+            }
+            result.append(byte)
+        }
+        return (result, response)
+    }
+
+    private static func validateCanonicalUUID(_ value: String, fieldName: String) throws {
+        guard value.range(
+            of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            options: .regularExpression
+        ) != nil else {
+            throw NitroPushError.integrityFailure(
+                "\(fieldName) is not a lowercase canonical UUID"
+            )
+        }
+    }
+
+    fileprivate static func validateReleaseId(_ releaseId: String) throws {
+        try validateCanonicalUUID(releaseId, fieldName: "releaseId")
+    }
+
+    fileprivate static func releaseDirectory(for releaseId: String) throws -> URL {
+        try validateReleaseId(releaseId)
+        let root = rootDir().standardizedFileURL
+        let directory = root.appendingPathComponent(releaseId, isDirectory: true).standardizedFileURL
+        guard directory.deletingLastPathComponent().path == root.path,
+              directory.lastPathComponent == releaseId else {
+            throw NitroPushError.integrityFailure("release directory escapes the update root")
+        }
+        return directory
+    }
+
     /// Resolve a bucket-relative `objectKey` to an absolute URL using the
     /// configured `storageBaseUrl`.
     private func resolveObjectURL(_ objectKey: String) throws -> URL {
         guard let base = self.storageBaseUrl else {
             throw NitroPushError.notConfigured
         }
+        let segments = objectKey.split(separator: "/", omittingEmptySubsequences: false)
+        guard !objectKey.isEmpty,
+              !objectKey.hasPrefix("//"),
+              !objectKey.contains("?"),
+              !objectKey.contains("#"),
+              !objectKey.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }),
+              !segments.contains(where: { $0 == "." || $0 == ".." }) else {
+            throw NitroPushError.integrityFailure("unsafe storage object key")
+        }
         let key = objectKey.hasPrefix("/") ? String(objectKey.dropFirst()) : objectKey
         guard let url = URL(string: "\(base)/\(key)") else {
             throw NitroPushError.invalidConfig("Cannot build URL from \(base) and \(objectKey)")
         }
-        return url
+        return try Self.validatedNetworkURL(url.absoluteString, name: "download URL")
     }
 
     public func checkForUpdate(deploymentKeyOverride: String? = nil) async throws -> NPRemotePackage? {
@@ -410,6 +587,7 @@ public final class NitroPushSdk {
     ) {
         guard let a = analytics else { return }
         let event = NlAnalyticsEvent(
+            eventId: UUID().uuidString.lowercased(),
             eventType: type,
             clientUniqueId: self.clientUniqueId ?? Self.fallbackDeviceId(),
             appVersion: appVersion ?? self.appVersion ?? "*",
@@ -449,7 +627,12 @@ public final class NitroPushSdk {
     /// **NOT exposed via the Nitro bridge** — it's a native-only call.
     public func activeBundleURL() -> URL? {
         guard let active = readActive() else { return nil }
-        let url = URL(fileURLWithPath: active.bundlePath)
+        guard let releaseDir = try? Self.releaseDirectory(for: active.releaseId) else { return nil }
+        let url = URL(fileURLWithPath: active.bundlePath).standardizedFileURL
+        guard url.path.hasPrefix(releaseDir.path + "/") else {
+            log("activeBundleURL → skipped", "stored bundle path escapes its release directory")
+            return nil
+        }
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         guard isHermesBundle(at: url.path) else {
             log("activeBundleURL → skipped",
@@ -517,7 +700,7 @@ public final class NitroPushSdk {
         if let pending = pendingSuspend {
             log("lifecycle.didEnterBackground → activating ON_NEXT_SUSPEND",
                 "releaseId=\(pending.releaseId)")
-            try? activatePendingSync()
+            _ = try? activatePendingSync()
             pendingSuspend = nil
         }
     }
@@ -531,7 +714,7 @@ public final class NitroPushSdk {
             log("lifecycle.willEnterForeground → activating ON_NEXT_RESUME + reload",
                 "releaseId=\(pkg.releaseId)")
             try? persistPending(pkg)
-            try? activatePendingSync()
+            _ = try? activatePendingSync()
             reloadBridge()
             pendingResumeAfterBackground = nil
             pruneUnusedBundlesAndCache()
@@ -540,7 +723,9 @@ public final class NitroPushSdk {
 
     private func requestLatestRelease(deploymentKey: String?) async throws -> NPRemotePackage? {
         guard let server = serverUrl else { throw NitroPushError.notConfigured }
-        guard let key = deploymentKey else {
+        guard let key = deploymentKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else {
             throw NitroPushError.invalidConfig("deploymentKey not set")
         }
 
@@ -549,7 +734,6 @@ public final class NitroPushSdk {
             resolvingAgainstBaseURL: false
         )
         var qs: [URLQueryItem] = [
-            URLQueryItem(name: "deploymentKey", value: key),
             URLQueryItem(name: "platform", value: "ios"),
         ]
         if let v = appVersion { qs.append(URLQueryItem(name: "appVersion", value: v)) }
@@ -566,9 +750,11 @@ public final class NitroPushSdk {
             throw NitroPushError.invalidConfig("bad server URL")
         }
 
-        var request = URLRequest(url: url)
-        if let deviceToken { request.setValue(deviceToken, forHTTPHeaderField: "x-nitropush-device-token") }
-        let (data, response) = try await session.data(for: request)
+        let request = try requestForAPIURL(url, deploymentKey: key)
+        let (data, response) = try await data(
+            for: request,
+            maximumBytes: Self.maxLatestResponseBytes
+        )
         guard let http = response as? HTTPURLResponse else {
             throw NitroPushError.networkFailure("non-HTTP response")
         }
@@ -578,6 +764,7 @@ public final class NitroPushSdk {
            let tokenKey = deviceTokenStorageKey {
             deviceToken = issuedToken
             UserDefaults.standard.set(issuedToken, forKey: tokenKey)
+            analytics?.setDeviceToken(issuedToken)
         }
         if http.statusCode == 204 { return nil }
         guard (200..<300).contains(http.statusCode) else {
@@ -592,22 +779,49 @@ public final class NitroPushSdk {
         } catch {
             throw NitroPushError.networkFailure(
                 describeManifestFetch(url: url, response: http, body: data,
-                                      reason: "checkForUpdate JSON decode failed: \(error)")
+                                      reason: "checkForUpdate JSON decode failed")
             )
         }
         // Cache the pre-signed manifest proxy URL so downloadManifestRelease
         // uses it instead of constructing an unsigned storageBaseUrl + objectKey.
         if let wrapper = parsed.release, let proxyUrl = wrapper.downloadUrl {
-            let resolved = URL(string: proxyUrl, relativeTo: server)?.absoluteURL.absoluteString
-            if let resolved { manifestUrlOverride[wrapper.pkg.releaseId] = resolved }
+            if let resolved = URL(string: proxyUrl, relativeTo: server)?.absoluteURL {
+                let validated = try Self.validatedNetworkURL(
+                    resolved.absoluteString,
+                    name: "manifest download URL",
+                    allowQuery: true
+                )
+                manifestUrlOverride[wrapper.pkg.releaseId] = validated.absoluteString
+            }
         }
-        return parsed.release?.pkg
+        guard let pkg = parsed.release?.pkg else { return nil }
+        try Self.validateReleaseId(pkg.releaseId)
+        manifestDeploymentKeyHash[pkg.releaseId] = Self.sha256Hex(Data(key.utf8))
+        guard pkg.kind == "expo" || pkg.kind == "codepush" else {
+            throw NitroPushError.integrityFailure("unsupported release kind")
+        }
+        guard pkg.packageSize.isFinite,
+              pkg.packageSize > 0,
+              pkg.packageSize <= Double(Self.maxBundleBytes),
+              pkg.packageHash.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else {
+            throw NitroPushError.integrityFailure("release metadata is malformed")
+        }
+        if pkg.appVersion != "*", let binaryVersion = appVersion, pkg.appVersion != binaryVersion {
+            throw NitroPushError.integrityFailure("release runtime does not match this binary")
+        }
+        if let active = readActive(),
+           active.appVersion == pkg.appVersion,
+           let activeVersion = active.otaVersion,
+           let offeredVersion = pkg.otaVersion,
+           offeredVersion <= activeVersion,
+           active.releaseId != pkg.releaseId {
+            throw NitroPushError.integrityFailure("refusing a non-monotonic OTA release")
+        }
+        return pkg
     }
 
-    /// Build a self-diagnosing error string for an HTTP fetch that didn't
-    /// produce the expected JSON. Includes the URL, status, content-type,
-    /// and a 200-char body snippet so the failure tells the operator exactly
-    /// what the server returned.
+    /// Build a diagnostic without copying presigned query parameters or
+    /// potentially sensitive response bodies into device logs/crash reports.
     private func describeManifestFetch(
         url: URL,
         response: HTTPURLResponse?,
@@ -616,16 +830,12 @@ public final class NitroPushSdk {
     ) -> String {
         let status = response?.statusCode.description ?? "no-http-response"
         let contentType = response?.value(forHTTPHeaderField: "Content-Type") ?? "unknown"
-        let bodyStr = String(data: body, encoding: .utf8) ?? "<non-utf8 \(body.count) bytes>"
-        let snippet = bodyStr.count > 200
-            ? String(bodyStr.prefix(200)) + "…(+\(bodyStr.count - 200) more chars)"
-            : bodyStr
-        return "\(reason) — url=\(url.absoluteString) status=\(status) " +
-               "contentType=\(contentType) body=\(snippet)"
+        return "\(reason) — url=\(Self.redactedURL(url)) status=\(status) " +
+               "contentType=\(contentType) responseBytes=\(body.count)"
     }
 
     private func performDownload(_ pkg: NPRemotePackage) async throws -> NPLocalPackage {
-        let dir = Self.rootDir().appendingPathComponent(pkg.releaseId, isDirectory: true)
+        let dir = try Self.releaseDirectory(for: pkg.releaseId)
         try? FileManager.default.removeItem(at: dir)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
@@ -764,6 +974,96 @@ public final class NitroPushSdk {
         return payload
     }
 
+    /// Canonical signature envelope for schema 4. The upload client signs
+    /// this only after the API has reserved `releaseId` and `otaVersion`.
+    /// Length-prefixing makes separators inside labels/paths unambiguous.
+    private static func releaseIntegrityPayload(_ manifest: SdkManifest) throws -> String {
+        guard let releaseId = manifest.releaseId,
+              let projectId = manifest.projectId,
+              let environment = manifest.environment,
+              let deploymentKeyHash = manifest.deploymentKeyHash,
+              let kind = manifest.kind,
+              let platforms = manifest.platforms,
+              let targetAppVersion = manifest.targetAppVersion,
+              let otaVersion = manifest.otaVersion,
+              otaVersion.isFinite,
+              otaVersion > 0,
+              otaVersion.rounded(.towardZero) == otaVersion,
+              otaVersion <= Double(Int64.max),
+              let label = manifest.label,
+              let isMandatory = manifest.isMandatory,
+              let bundleSize = manifest.bundle.size else {
+            throw NitroPushError.integrityFailure("signed release envelope is incomplete")
+        }
+        try validateReleaseId(releaseId)
+        try validateCanonicalUUID(projectId, fieldName: "projectId")
+        guard deploymentKeyHash.range(
+            of: "^[a-f0-9]{64}$",
+            options: .regularExpression
+        ) != nil else {
+            throw NitroPushError.integrityFailure("signed deployment key hash is invalid")
+        }
+        func field(_ name: String, _ value: String) -> String {
+            "\(name):\(value.lengthOfBytes(using: .utf8)):\(value)\n"
+        }
+        func artifact(_ kind: String, _ path: String, _ hash: String, _ size: Int) -> String {
+            "\(kind):\(path.lengthOfBytes(using: .utf8)):\(path):\(hash):\(size)\n"
+        }
+        let sortedPlatforms = platforms.sorted()
+        guard !sortedPlatforms.isEmpty,
+              sortedPlatforms.count == Set(sortedPlatforms).count,
+              sortedPlatforms.allSatisfy({ $0 == "ios" || $0 == "android" }) else {
+            throw NitroPushError.integrityFailure("signed release platforms are invalid")
+        }
+        var payload = "nitropush-release-v2\n"
+        payload += field("releaseId", releaseId.lowercased())
+        payload += field("projectId", projectId.lowercased())
+        payload += field("environment", environment)
+        payload += field("deploymentKeyHash", deploymentKeyHash.lowercased())
+        payload += field("kind", kind)
+        payload += "platforms:\(sortedPlatforms.count)\n"
+        for platform in sortedPlatforms { payload += field("platform", platform) }
+        payload += field("runtimeVersion", targetAppVersion)
+        payload += field("label", label)
+        payload += "otaVersion:\(Int64(otaVersion))\n"
+        payload += "mandatory:\(isMandatory ? 1 : 0)\n"
+        payload += artifact(
+            "bundle",
+            manifest.bundle.originalPath,
+            manifest.bundle.sha256,
+            bundleSize
+        )
+        payload += "assets:\(manifest.assets.count)\n"
+        for asset in manifest.assets {
+            guard let size = asset.size else {
+                throw NitroPushError.integrityFailure("signed release asset is missing size")
+            }
+            payload += artifact("asset", asset.originalPath, asset.sha256, size)
+        }
+        return payload
+    }
+
+    private func validateSignedContext(_ manifest: SdkManifest, package: NPRemotePackage) throws {
+        let expectedDeploymentHash = manifestDeploymentKeyHash[package.releaseId]
+            ?? deploymentKeyHash
+        guard manifest.releaseId?.caseInsensitiveCompare(package.releaseId) == .orderedSame,
+              manifest.kind == package.kind,
+              manifest.label == package.label,
+              manifest.targetAppVersion == package.appVersion,
+              manifest.otaVersion == package.otaVersion,
+              manifest.isMandatory == package.isMandatory,
+              Set(manifest.platforms ?? []) == Set(package.platforms ?? []),
+              manifest.bundle.sha256 == package.packageHash.lowercased(),
+              manifest.deploymentKeyHash?.lowercased() == expectedDeploymentHash else {
+            throw NitroPushError.integrityFailure(
+                "latest-release metadata does not match the signed release envelope"
+            )
+        }
+        guard (manifest.platforms ?? []).contains("ios") else {
+            throw NitroPushError.integrityFailure("signed release does not target iOS")
+        }
+    }
+
     private func downloadManifestRelease(pkg: NPRemotePackage, releaseDir: URL) async throws -> String {
         // Prefer the server-issued downloadUrl (manifest proxy with signed asset URLs)
         // over constructing an unsigned CDN URL from storageBaseUrl + objectKey.
@@ -774,12 +1074,22 @@ public final class NitroPushSdk {
         } else {
             url = try resolveObjectURL(pkg.downloadObjectKey)
         }
-        log("downloadManifestRelease", "GET \(url.absoluteString)")
-        var manifestRequest = URLRequest(url: url)
-        if let deviceToken {
-            manifestRequest.setValue(deviceToken, forHTTPHeaderField: "x-nitropush-device-token")
+        let validatedURL = try Self.validatedNetworkURL(
+            url.absoluteString,
+            name: "manifest download URL",
+            allowQuery: true
+        )
+        log("downloadManifestRelease", "GET \(Self.redactedURL(validatedURL))")
+        let manifestRequest: URLRequest
+        if let api = serverUrl, Self.sameOrigin(validatedURL, api) {
+            manifestRequest = try requestForAPIURL(validatedURL)
+        } else {
+            manifestRequest = URLRequest(url: validatedURL)
         }
-        let (manifestData, response) = try await session.data(for: manifestRequest)
+        let (manifestData, response) = try await data(
+            for: manifestRequest,
+            maximumBytes: Self.maxManifestBytes
+        )
         let http = response as? HTTPURLResponse
         guard let http = http, (200..<300).contains(http.statusCode) else {
             throw NitroPushError.networkFailure(
@@ -797,15 +1107,12 @@ public final class NitroPushSdk {
             // instead of "Unexpected character '<' around line 1, column 1".
             throw NitroPushError.networkFailure(
                 describeManifestFetch(url: url, response: http, body: manifestData,
-                                      reason: "JSON decode failed: \(error)")
+                                      reason: "JSON decode failed")
             )
         }
 
-        guard manifestData.count <= 2 * 1024 * 1024 else {
-            throw NitroPushError.integrityFailure("release manifest exceeds the allowed size")
-        }
         let schemaVersion = manifest.schemaVersion ?? 2
-        guard schemaVersion == 2 || schemaVersion == 3 else {
+        guard schemaVersion == 2 || schemaVersion == 3 || schemaVersion == 4 else {
             throw NitroPushError.integrityFailure("unsupported release manifest schema \(schemaVersion)")
         }
         guard pkg.packageHash.lowercased() == manifest.bundle.sha256 else {
@@ -814,11 +1121,12 @@ public final class NitroPushSdk {
         let layout = try validateManifestLayout(manifest, releaseDir: releaseDir)
 
         if let pubKey = self.bundlePublicKey {
-            guard schemaVersion == 3 else {
+            guard schemaVersion == 4 else {
                 throw NitroPushError.integrityFailure(
-                    "signed projects require manifest schema 3; refusing legacy downgrade"
+                    "signed projects require manifest schema 4; refusing legacy/context downgrade"
                 )
             }
+            try validateSignedContext(manifest, package: pkg)
             guard let sig = manifest.bundle.signature else {
                 throw NitroPushError.integrityFailure(
                     "bundle is unsigned but a bundlePublicKey is configured — refusing to install"
@@ -829,14 +1137,14 @@ public final class NitroPushSdk {
                 signatureBase64: sig,
                 publicKeyBase64: pubKey
             )
-            guard let integritySignature = manifest.integritySignature else {
-                throw NitroPushError.integrityFailure("signed manifest is missing its integrity signature")
+            guard let releaseSignature = manifest.releaseSignature else {
+                throw NitroPushError.integrityFailure("signed manifest is missing its release envelope signature")
             }
             try Self.verifySignature(
-                message: try Self.manifestIntegrityPayload(manifest),
-                signatureBase64: integritySignature,
+                message: try Self.releaseIntegrityPayload(manifest),
+                signatureBase64: releaseSignature,
                 publicKeyBase64: pubKey,
-                description: "release manifest"
+                description: "release envelope"
             )
         }
 
@@ -886,6 +1194,7 @@ public final class NitroPushSdk {
             }
         }
 
+        var installedBytes = 0
         if !usedDelta {
             let bundleDownloadUrl: String
             if let url = manifest.bundle.downloadUrl {
@@ -893,12 +1202,19 @@ public final class NitroPushSdk {
             } else {
                 bundleDownloadUrl = try resolveObjectURL(manifest.bundle.objectKey).absoluteString
             }
-            try await fetchByContentHash(
+            installedBytes += try await fetchByContentHash(
                 urlString: bundleDownloadUrl,
                 sha256: manifest.bundle.sha256,
                 dest: bundleDest,
-                announcedSize: manifest.bundle.size ?? -1
+                announcedSize: manifest.bundle.size ?? -1,
+                maximumBytes: Self.maxBundleBytes
             )
+        } else {
+            let values = try bundleDest.resourceValues(forKeys: [.fileSizeKey])
+            installedBytes += values.fileSize ?? 0
+        }
+        guard installedBytes <= Self.maxReleaseBytes else {
+            throw NitroPushError.integrityFailure("release content exceeds the allowed size")
         }
 
         var cachedHashes = Set<String>()
@@ -916,12 +1232,16 @@ public final class NitroPushSdk {
             } else {
                 assetDownloadUrl = try resolveObjectURL(asset.objectKey).absoluteString
             }
-            try await fetchByContentHash(
+            installedBytes += try await fetchByContentHash(
                 urlString: assetDownloadUrl,
                 sha256: asset.sha256,
                 dest: dest,
-                announcedSize: asset.size ?? -1
+                announcedSize: asset.size ?? -1,
+                maximumBytes: Self.maxAssetBytes
             )
+            guard installedBytes <= Self.maxReleaseBytes else {
+                throw NitroPushError.integrityFailure("release content exceeds the allowed size")
+            }
             cachedHashes.insert(asset.sha256)
             emitProgress(NPDownloadProgress(
                 receivedBytes: Double(idx + 1),
@@ -946,8 +1266,9 @@ public final class NitroPushSdk {
         urlString: String,
         sha256: String,
         dest: URL,
-        announcedSize: Int
-    ) async throws {
+        announcedSize: Int,
+        maximumBytes: Int
+    ) async throws -> Int {
         let cacheDir = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         let cached = cacheDir.appendingPathComponent(sha256)
@@ -955,19 +1276,26 @@ public final class NitroPushSdk {
         if FileManager.default.fileExists(atPath: cached.path) {
             let cachedHash = try Self.sha256Hex(of: cached)
             let values = try cached.resourceValues(forKeys: [.fileSizeKey])
-            if cachedHash != sha256 || (announcedSize > 0 && values.fileSize != announcedSize) {
+            if cachedHash != sha256
+                || values.fileSize == nil
+                || values.fileSize! <= 0
+                || values.fileSize! > maximumBytes
+                || (announcedSize > 0 && values.fileSize != announcedSize) {
                 try? FileManager.default.removeItem(at: cached)
             }
         }
         if !FileManager.default.fileExists(atPath: cached.path) {
-            guard let url = URL(string: urlString) else {
-                throw NitroPushError.invalidConfig("bad asset URL: \(urlString)")
-            }
+            let url = try Self.validatedNetworkURL(
+                urlString,
+                name: "asset download URL",
+                allowQuery: true
+            )
             try await downloadToFile(
                 url: url,
                 dest: cached,
                 expectedSha256: sha256,
-                announcedSize: announcedSize
+                announcedSize: announcedSize,
+                maximumBytes: maximumBytes
             )
         } else {
             touchFile(cached)
@@ -976,15 +1304,25 @@ public final class NitroPushSdk {
             try FileManager.default.removeItem(at: dest)
         }
         try FileManager.default.copyItem(at: cached, to: dest)
+        let values = try dest.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values.fileSize, size > 0, size <= maximumBytes else {
+            try? FileManager.default.removeItem(at: dest)
+            throw NitroPushError.integrityFailure("download exceeds the allowed size")
+        }
+        return size
     }
 
     private func downloadToFile(
         url: URL,
         dest: URL,
         expectedSha256: String,
-        announcedSize: Int
+        announcedSize: Int,
+        maximumBytes: Int
     ) async throws {
-        let progressDelegate = ProgressTrackingDelegate { [weak self] received in
+        let enforcedMaximum = announcedSize > 0
+            ? min(maximumBytes, announcedSize)
+            : maximumBytes
+        let progressDelegate = ProgressTrackingDelegate(maximumBytes: Int64(enforcedMaximum)) { [weak self] received in
             guard announcedSize > 0 else { return }
             self?.emitProgress(NPDownloadProgress(
                 receivedBytes: Double(received),
@@ -996,13 +1334,29 @@ public final class NitroPushSdk {
             delegate: progressDelegate,
             delegateQueue: .main
         )
-        let (tmpURL, response) = try await dlSession.download(from: url)
+        let tmpURL: URL
+        let response: URLResponse
+        do {
+            (tmpURL, response) = try await dlSession.download(from: url)
+        } catch {
+            if progressDelegate.exceededLimit {
+                throw NitroPushError.integrityFailure("download exceeds the allowed size")
+            }
+            throw error
+        }
         defer { dlSession.invalidateAndCancel() }
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw NitroPushError.networkFailure("HTTP \(String(describing: response)) for \(url)")
+            throw NitroPushError.networkFailure(
+                "download returned a non-success response from \(Self.redactedURL(url))"
+            )
+        }
+        let values = try tmpURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let downloadedSize = values.fileSize,
+              downloadedSize > 0,
+              downloadedSize <= maximumBytes else {
+            throw NitroPushError.integrityFailure("download exceeds the allowed size")
         }
         if announcedSize > 0 {
-            let values = try tmpURL.resourceValues(forKeys: [.fileSizeKey])
             guard values.fileSize == announcedSize else {
                 throw NitroPushError.integrityFailure(
                     "download size mismatch (expected \(announcedSize), received \(values.fileSize ?? -1))"
@@ -1020,7 +1374,7 @@ public final class NitroPushSdk {
             if actual.lowercased() != expectedSha256.lowercased() {
                 try? FileManager.default.removeItem(at: dest)
                 throw NitroPushError.integrityFailure(
-                    "integrity check failed for \(url) (expected \(expectedSha256) got \(actual))"
+                    "download integrity check failed"
                 )
             }
         }
@@ -1057,7 +1411,13 @@ public final class NitroPushSdk {
             .appendingPathComponent("nitropush-patch-\(delta.patchSha256).bsdiff")
         defer { try? FileManager.default.removeItem(at: tmpPatch) }
 
-        try await downloadToFile(url: patchUrl, dest: tmpPatch, expectedSha256: delta.patchSha256, announcedSize: delta.patchSize)
+        try await downloadToFile(
+            url: patchUrl,
+            dest: tmpPatch,
+            expectedSha256: delta.patchSha256,
+            announcedSize: delta.patchSize,
+            maximumBytes: Self.maxBundleBytes
+        )
 
         // Apply bsdiff4 patch. _bspatch_apply is declared in BspatchBridge.swift
         // via @_silgen_name, which links directly to the C symbol in bspatch.c.
@@ -1099,15 +1459,27 @@ public final class NitroPushSdk {
 // MARK: - Wire types for the SDK release manifest
 
 /// Matches the JSON written by `createCodepushRelease` /
-/// `createExpoRelease` in `@nitropush/shared-services`. Decoder is
-/// permissive: only the bundle + assets entries are needed at install
-/// time, so anything else (kind, platforms, label, otaVersion, …) is
-/// ignored.
+/// `createExpoRelease` in `@nitropush/shared-services`. Context fields are
+/// optional only for unsigned legacy manifests; a configured public key
+/// requires every schema-4 field below and verifies them fail closed.
 private struct SdkManifest: Decodable {
     let schemaVersion: Int?
+    let releaseId: String?
+    let projectId: String?
+    let environment: String?
+    let deploymentKeyHash: String?
+    let kind: String?
+    let platforms: [String]?
+    let targetAppVersion: String?
+    let otaVersion: Double?
+    let label: String?
+    let isMandatory: Bool?
     let bundle: SdkManifestBundle
     let assets: [SdkManifestAsset]
+    /// Schema 3 legacy content-only signature.
     let integritySignature: String?
+    /// Schema 4 signature over release identity, targeting and all artifacts.
+    let releaseSignature: String?
 }
 
 private struct SdkManifestBundleDelta: Decodable {
@@ -1190,7 +1562,10 @@ extension NitroPushSdk {
     }
 
     private func deleteBundleDir(releaseId: String) {
-        let dir = Self.rootDir().appendingPathComponent(releaseId, isDirectory: true)
+        guard let dir = try? Self.releaseDirectory(for: releaseId) else {
+            log("deleteBundleDir → skipped", "invalid release id")
+            return
+        }
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -1230,8 +1605,8 @@ extension NitroPushSdk {
     }
 
     private func readReleaseFileHashes(releaseId: String) -> [String] {
-        let manifest = Self.rootDir()
-            .appendingPathComponent(releaseId, isDirectory: true)
+        guard let releaseDir = try? Self.releaseDirectory(for: releaseId) else { return [] }
+        let manifest = releaseDir
             .appendingPathComponent(Self.releaseFilesManifestName)
         guard let data = try? Data(contentsOf: manifest),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1488,13 +1863,47 @@ extension NPRemotePackage: Decodable {
     }
 }
 
+private final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 private final class ProgressTrackingDelegate: NSObject, URLSessionDownloadDelegate {
     private let onProgress: (Int64) -> Void
-    init(onProgress: @escaping (Int64) -> Void) { self.onProgress = onProgress }
+    private let maximumBytes: Int64
+    private(set) var exceededLimit = false
+
+    init(maximumBytes: Int64, onProgress: @escaping (Int64) -> Void) {
+        self.maximumBytes = maximumBytes
+        self.onProgress = onProgress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64,
                     totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
+        if totalBytesWritten > maximumBytes {
+            exceededLimit = true
+            downloadTask.cancel()
+            return
+        }
         onProgress(totalBytesWritten)
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
@@ -1530,7 +1939,10 @@ extension NPLocalPackage {
               let packageSize = dict["packageSize"] as? Double,
               let appVersion = dict["appVersion"] as? String,
               let isMandatory = dict["isMandatory"] as? Bool,
-              let bundlePath = dict["bundlePath"] as? String else { return nil }
+              let bundlePath = dict["bundlePath"] as? String,
+              let releaseDir = try? NitroPushSdk.releaseDirectory(for: releaseId),
+              URL(fileURLWithPath: bundlePath).standardizedFileURL.path.hasPrefix(releaseDir.path + "/")
+        else { return nil }
         return NPLocalPackage(
             releaseId: releaseId,
             label: label,

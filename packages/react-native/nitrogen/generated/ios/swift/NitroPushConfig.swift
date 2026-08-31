@@ -50,7 +50,7 @@ public extension NitroPushConfig {
   var serverUrl: String {
     return String(self.__serverUrl)
   }
-  
+
   @inline(__always)
   var deploymentKey: String {
     return String(self.__deploymentKey)

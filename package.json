@@ -17,7 +17,7 @@
     "release": "yarn workspace @nitropush/react-native release"
   },
   "devDependencies": {
-    "turbo": "2.9.9",
+    "turbo": "2.10.12",
     "typescript": "^5.6.3"
   }
 }

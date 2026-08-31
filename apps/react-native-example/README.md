@@ -23,5 +23,7 @@ yarn workspace @nitropush/react-native-example ios
 yarn workspace @nitropush/react-native-example android
 ```
 
-Point the demo at your dev server by editing the `NITROPUSH_SERVER_URL`
-and `DEPLOYMENT_KEY` constants at the top of `App.tsx`.
+Replace `NITROPUSH_DEPLOYMENT_KEY` in Info.plist and AndroidManifest. Signed
+projects must also add the full `NITROPUSH_BUNDLE_PUBLIC_KEY` to both files.
+Configuration and `notifyAppReady()` stay in `App.tsx`; do not move the health
+confirmation into a native foreground callback.

@@ -10,12 +10,7 @@
     "newArchEnabled": true,
     "ios": {
       "bundleIdentifier": "com.expoexample",
-      "supportsTablet": true,
-      "infoPlist": {
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true
-        }
-      }
+      "supportsTablet": true
     },
     "android": {
       "package": "com.expoexample",
@@ -50,31 +45,15 @@
       [
         "@nitropush/react-native",
         {
-          "serverUrl": "https://api.nitropush.org",
-          "deploymentKey": "nl_test_eCRLfzr07MDeCjrOc_P1MoGkpXIBUj7JyHtCCasNlK4",
-          "storageBaseUrl": "https://cdn.nitropush.org"
-        }
-      ],
-      [
-        "./plugins/with-network-security-config",
-        {
-          "permissive": true,
-          "cleartextHosts": [
-            "10.0.2.2",
-            "localhost",
-            "127.0.0.1",
-            "192.168.0.141"
-          ]
+          "deploymentKey": "REPLACE_WITH_DEPLOYMENT_KEY",
+          "ios": true,
+          "android": true
         }
       ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": false
-    },
-    "extra": {
-      "nitropushServerUrl": "https://api.nitropush.org",
-      "nitropushDeploymentKey": "nl_test_eCRLfzr07MDeCjrOc_P1MoGkpXIBUj7JyHtCCasNlK4"
     }
   }
 }
