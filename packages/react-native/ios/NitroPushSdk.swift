@@ -92,12 +92,26 @@ public final class NitroPushSdk {
     /// SHA-256 of the JS bundle shipped in the native binary. Used as the
     /// first delta base before any OTA package is active.
     private lazy var embeddedBundleHash: String? = {
+        guard let bundleUrl = embeddedBundleURL() else { return nil }
+        return try? Self.sha256Hex(of: bundleUrl)
+    }()
+
+    private func embeddedBundleURL() -> URL? {
         let named = Bundle.main.url(forResource: "main", withExtension: "jsbundle")
         let fallback = Bundle.main.urls(forResourcesWithExtension: "hbc", subdirectory: nil)?.first
             ?? Bundle.main.urls(forResourcesWithExtension: "jsbundle", subdirectory: nil)?.first
-        guard let bundleUrl = named ?? fallback else { return nil }
-        return try? Self.sha256Hex(of: bundleUrl)
-    }()
+        return named ?? fallback
+    }
+
+    /// The embedded bundle is a valid delta base only while no OTA release is
+    /// active. In particular, never fall back to the embedded hash merely
+    /// because an active package is missing its stored bundle hash.
+    private func currentBundleHashForDelta() -> String? {
+        if let active = readActive() {
+            return active.bundleHash
+        }
+        return embeddedBundleHash
+    }
 
     private var progressListeners: [Int: (NPDownloadProgress) -> Void] = [:]
     private var nextListenerId: Int = 1
@@ -312,6 +326,28 @@ public final class NitroPushSdk {
             request.setValue(deploymentKey, forHTTPHeaderField: "x-nitropush-deployment-key")
         }
         return request
+    }
+
+    /// Resolve a server-issued delta URL and constrain it to the configured
+    /// HTTPS API origin before attaching the device proof header. Relative API
+    /// paths are accepted; protocol-relative/cross-origin URLs are rejected.
+    private func requestForDeltaDownload(_ raw: String) throws -> URLRequest {
+        guard let api = serverUrl,
+              let resolved = URL(string: raw, relativeTo: api)?.absoluteURL else {
+            throw NitroPushError.networkFailure("delta download URL is invalid")
+        }
+        let validated = try Self.validatedNetworkURL(
+            resolved.absoluteString,
+            name: "delta download URL",
+            allowQuery: true
+        )
+        guard validated.scheme?.lowercased() == "https",
+              Self.sameOrigin(validated, api) else {
+            throw NitroPushError.networkFailure(
+                "delta download URL must use the configured HTTPS API origin"
+            )
+        }
+        return try requestForAPIURL(validated)
     }
 
     private func data(
@@ -742,7 +778,7 @@ public final class NitroPushSdk {
         if let active {
             qs.append(URLQueryItem(name: "currentReleaseId", value: active.releaseId))
         }
-        if enableDeltaUpdates, let bundleHash = active?.bundleHash ?? embeddedBundleHash {
+        if enableDeltaUpdates, let bundleHash = currentBundleHashForDelta() {
             qs.append(URLQueryItem(name: "currentBundleHash", value: bundleHash))
         }
         components?.queryItems = qs
@@ -1159,8 +1195,8 @@ public final class NitroPushSdk {
         if enableDeltaUpdates,
            let delta = pkg.delta ?? manifest.bundle.delta?.toPlain(),
            delta.algorithm == "bsdiff4",
-           let activeBundleHash = readActive()?.bundleHash,
-           activeBundleHash == delta.fromBundleHash {
+           let currentBundleHash = currentBundleHashForDelta(),
+           currentBundleHash == delta.fromBundleHash {
             do {
                 try await applyDeltaPatch(
                     delta: delta,
@@ -1317,7 +1353,8 @@ public final class NitroPushSdk {
         dest: URL,
         expectedSha256: String,
         announcedSize: Int,
-        maximumBytes: Int
+        maximumBytes: Int,
+        authenticatedRequest: URLRequest? = nil
     ) async throws {
         let enforcedMaximum = announcedSize > 0
             ? min(maximumBytes, announcedSize)
@@ -1337,7 +1374,11 @@ public final class NitroPushSdk {
         let tmpURL: URL
         let response: URLResponse
         do {
-            (tmpURL, response) = try await dlSession.download(from: url)
+            if let authenticatedRequest {
+                (tmpURL, response) = try await dlSession.download(for: authenticatedRequest)
+            } else {
+                (tmpURL, response) = try await dlSession.download(from: url)
+            }
         } catch {
             if progressDelegate.exceededLimit {
                 throw NitroPushError.integrityFailure("download exceeds the allowed size")
@@ -1380,8 +1421,69 @@ public final class NitroPushSdk {
         }
     }
 
-    /// Download a bsdiff4 patch, verify its hash, apply it against the cached
-    /// base bundle, verify the output hash, then write the patched file to `dest`.
+    /// Select the bundle that is actually running, snapshot it into a private
+    /// temporary file, and verify that its bytes exactly match the delta base.
+    /// Before the first OTA this is the app-embedded bundle; afterwards it must
+    /// be the active OTA bundle. A historical cache entry is intentionally not
+    /// sufficient because it may not represent the currently running code.
+    private func materializeDeltaBase(expectedHash: String) throws -> URL {
+        guard expectedHash.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else {
+            throw NitroPushError.integrityFailure("delta base hash is invalid")
+        }
+
+        let source: URL
+        if let active = readActive() {
+            guard active.bundleHash == expectedHash else {
+                throw NitroPushError.integrityFailure("active bundle does not match the delta base")
+            }
+            let releaseDir = try Self.releaseDirectory(for: active.releaseId)
+                .resolvingSymlinksInPath()
+            let activeURL = URL(fileURLWithPath: active.bundlePath)
+                .resolvingSymlinksInPath()
+            guard activeURL.path.hasPrefix(releaseDir.path + "/"),
+                  FileManager.default.fileExists(atPath: activeURL.path) else {
+                throw NitroPushError.integrityFailure("active delta base is outside its release directory")
+            }
+            source = activeURL
+        } else {
+            guard embeddedBundleHash == expectedHash,
+                  let embeddedURL = embeddedBundleURL() else {
+                throw NitroPushError.integrityFailure("embedded bundle does not match the delta base")
+            }
+            source = embeddedURL.resolvingSymlinksInPath()
+        }
+
+        let sourceValues = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard sourceValues.isRegularFile == true,
+              let sourceSize = sourceValues.fileSize,
+              sourceSize > 0,
+              sourceSize <= Self.maxBundleBytes else {
+            throw NitroPushError.integrityFailure("delta base size is outside the allowed range")
+        }
+
+        let snapshot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nitropush-base-\(UUID().uuidString.lowercased()).bundle")
+        do {
+            try FileManager.default.copyItem(at: source, to: snapshot)
+            let snapshotValues = try snapshot.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard snapshotValues.isRegularFile == true,
+                  snapshotValues.fileSize == sourceSize,
+                  try Self.sha256Hex(of: snapshot) == expectedHash else {
+                throw NitroPushError.integrityFailure("delta base hash mismatch")
+            }
+            guard isHermesBundle(at: snapshot.path) else {
+                throw NitroPushError.integrityFailure("delta base is not a valid Hermes bundle")
+            }
+            return snapshot
+        } catch {
+            try? FileManager.default.removeItem(at: snapshot)
+            throw error
+        }
+    }
+
+    /// Download a bsdiff4 patch, verify its hash, apply it against an exact
+    /// snapshot of the currently running bundle, verify the output hash, then
+    /// write the patched file to `dest`.
     private func classifyDeltaError(_ error: Error) -> String {
         let msg = error.localizedDescription.lowercased()
         if msg.contains("hash") || msg.contains("sha") || msg.contains("integrity") {
@@ -1398,17 +1500,34 @@ public final class NitroPushSdk {
         expectedOutputSha256: String,
         dest: URL
     ) async throws {
-        // Base bundle must already be in the content-hash cache.
-        let cacheDir = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
-        let basePath = cacheDir.appendingPathComponent(delta.fromBundleHash).path
-        guard FileManager.default.fileExists(atPath: basePath) else {
-            throw NitroPushError.integrityFailure("base bundle not in cache: \(delta.fromBundleHash)")
+        guard delta.patchSha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              delta.patchSize > 0,
+              delta.patchSize <= Self.maxBundleBytes else {
+            throw NitroPushError.integrityFailure("delta patch metadata is invalid")
         }
 
-        // Download the patch file to a temp location.
-        let patchUrl = try resolveObjectURL(delta.patchObjectKey)
+        let base = try materializeDeltaBase(expectedHash: delta.fromBundleHash)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let cacheDir = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
+
+        // Prefer the API-issued device-bound URL. Older/self-hosted servers
+        // can omit it and retain the legacy object-storage path.
+        let patchRequest: URLRequest?
+        let patchUrl: URL
+        if let protectedUrl = delta.deltaDownloadUrl {
+            let request = try requestForDeltaDownload(protectedUrl)
+            guard let url = request.url else {
+                throw NitroPushError.networkFailure("delta download URL is invalid")
+            }
+            patchRequest = request
+            patchUrl = url
+        } else {
+            patchRequest = nil
+            patchUrl = try resolveObjectURL(delta.patchObjectKey)
+        }
         let tmpPatch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nitropush-patch-\(delta.patchSha256).bsdiff")
+            .appendingPathComponent("nitropush-patch-\(UUID().uuidString.lowercased()).bsdiff")
         defer { try? FileManager.default.removeItem(at: tmpPatch) }
 
         try await downloadToFile(
@@ -1416,15 +1535,16 @@ public final class NitroPushSdk {
             dest: tmpPatch,
             expectedSha256: delta.patchSha256,
             announcedSize: delta.patchSize,
-            maximumBytes: Self.maxBundleBytes
+            maximumBytes: Self.maxBundleBytes,
+            authenticatedRequest: patchRequest
         )
 
         // Apply bsdiff4 patch. _bspatch_apply is declared in BspatchBridge.swift
         // via @_silgen_name, which links directly to the C symbol in bspatch.c.
-        let rc = basePath.withCString { base in
+        let rc = base.path.withCString { basePath in
             tmpPatch.path.withCString { patch in
                 dest.path.withCString { out in
-                    _bspatch_apply(base, patch, out)
+                    _bspatch_apply(basePath, patch, out)
                 }
             }
         }
@@ -1495,7 +1615,8 @@ private struct SdkManifestBundleDelta: Decodable {
             patchObjectKey: patchObjectKey,
             patchSize: patchSize,
             patchSha256: patchSha256,
-            algorithm: algorithm
+            algorithm: algorithm,
+            deltaDownloadUrl: nil
         )
     }
 }
@@ -1850,7 +1971,12 @@ extension NPRemotePackage: Decodable {
                     patchObjectKey: key,
                     patchSize: size,
                     patchSha256: sha,
-                    algorithm: try c.decodeIfPresent(String.self, forKey: .deltaAlgorithm) ?? "bsdiff4"
+                    algorithm: try c.decodeIfPresent(String.self, forKey: .deltaAlgorithm) ?? "bsdiff4",
+                    deltaDownloadUrl: try c.decodeIfPresent(String.self, forKey: .deltaDownloadUrl)
+                        .flatMap {
+                            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                            return trimmed.isEmpty ? nil : trimmed
+                        }
                 )
             }()
         )
@@ -1860,6 +1986,7 @@ extension NPRemotePackage: Decodable {
         case otaVersion, displayVersion, platforms
         case isMandatory, description, downloadObjectKey
         case deltaFromBundleHash, deltaObjectKey, deltaSizeBytes, deltaPatchSha256, deltaAlgorithm
+        case deltaDownloadUrl
     }
 }
 

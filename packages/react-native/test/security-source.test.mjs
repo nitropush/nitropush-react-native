@@ -9,6 +9,11 @@ const android = readFileSync(
   `${packageRoot}/android/src/main/java/com/nitropush/sdk/NitroPushSdk.kt`,
   "utf8",
 );
+const iosTypes = readFileSync(`${packageRoot}/ios/NitroPushTypes.swift`, "utf8");
+const androidTypes = readFileSync(
+  `${packageRoot}/android/src/main/java/com/nitropush/sdk/NitroPushTypes.kt`,
+  "utf8",
+);
 const iosAnalytics = readFileSync(
   `${packageRoot}/ios/NitroPushAnalytics.swift`,
   "utf8",
@@ -115,4 +120,58 @@ test("Android bspatch loads the case-sensitive CMake library name", () => {
   const loadedLibrary = androidBspatchJni.match(/System\.loadLibrary\("([^"]+)"\)/)?.[1];
 
   assert.equal(loadedLibrary, packageName);
+});
+
+test("first-OTA deltas use an exact embedded base and later deltas use only the active OTA", () => {
+  assert.match(
+    ios,
+    /private func currentBundleHashForDelta\(\)[\s\S]*if let active = readActive\(\)[\s\S]*return active\.bundleHash[\s\S]*return embeddedBundleHash/,
+  );
+  assert.match(
+    android,
+    /private fun currentBundleHashForDelta\(\)[\s\S]*if \(active != null\) active\.bundleHash else embeddedBundleHash/,
+  );
+  assert.doesNotMatch(ios, /active\?\.bundleHash \?\? embeddedBundleHash/);
+  assert.doesNotMatch(android, /active\?\.bundleHash \?: embeddedBundleHash/);
+
+  for (const source of [ios, android]) {
+    assert.match(source, /currentBundleHashForDelta\(\)/);
+    assert.match(source, /materializeDeltaBase/);
+    assert.match(source, /delta base hash is invalid/);
+    assert.match(source, /delta base hash mismatch/);
+    assert.match(source, /delta base is not a valid Hermes bundle/);
+    assert.match(source, /delta patch metadata is invalid/);
+    assert.doesNotMatch(source, /base bundle not in cache/);
+  }
+
+  assert.match(ios, /activeURL\.path\.hasPrefix\(releaseDir\.path \+ "\/"\)/);
+  assert.match(ios, /embeddedBundleHash == expectedHash[\s\S]*embeddedBundleURL\(\)/);
+  assert.match(ios, /try Self\.sha256Hex\(of: snapshot\) == expectedHash/);
+  assert.match(android, /activeFile\.path\.startsWith\(releaseDir\.path \+ File\.separator\)/);
+  assert.match(android, /embedded\.sha256 == expectedHash/);
+  assert.match(android, /sha256Hex\(snapshot\) == expectedHash/);
+});
+
+test("device-bound delta URLs stay on the HTTPS API origin and retain legacy fallback", () => {
+  for (const source of [iosTypes, androidTypes, ios, android]) {
+    assert.match(source, /deltaDownloadUrl/);
+  }
+
+  assert.match(
+    ios,
+    /requestForDeltaDownload[\s\S]*validated\.scheme\?\.lowercased\(\) == "https"[\s\S]*sameOrigin\(validated, api\)[\s\S]*requestForAPIURL\(validated\)/,
+  );
+  assert.match(
+    android,
+    /validatedDeltaDownloadUrl[\s\S]*protocol\.equals\("https", ignoreCase = true\)[\s\S]*sameOrigin\(validated, api\)/,
+  );
+  assert.match(ios, /if let protectedUrl = delta\.deltaDownloadUrl[\s\S]*else \{[\s\S]*resolveObjectURL/);
+  assert.match(android, /deltaDownloadUrl\?\.let\(::validatedDeltaDownloadUrl\)[\s\S]*\?: resolveObjectUrl/);
+  assert.match(ios, /download\(for: authenticatedRequest\)/);
+  assert.match(android, /includeDeviceToken = protectedUrl != null/);
+
+  // Existing download delegates/connections reject redirects for both the
+  // protected path and the legacy object-storage path.
+  assert.match(ios, /ProgressTrackingDelegate[\s\S]*willPerformHTTPRedirection[\s\S]*completionHandler\(nil\)/);
+  assert.match(android, /instanceFollowRedirects = false/);
 });

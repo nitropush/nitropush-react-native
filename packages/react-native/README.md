@@ -26,6 +26,47 @@ cd ios && pod install
 
 ## Native setup
 
+### Expo — config plugin
+
+Keep the deployment credential out of `app.json` and the JavaScript bundle. Use
+an Expo app config that names a private build environment variable; the plugin
+resolves it during `expo prebuild` and writes the value only to the generated
+native `Info.plist` / `AndroidManifest.xml`:
+
+```js
+// app.config.js
+module.exports = {
+  expo: {
+    // ...
+    plugins: [
+      [
+        "@nitropush/react-native",
+        {
+          // Optional: this is the default name.
+          deploymentKeyEnvVar: "NITROPUSH_DEPLOYMENT_KEY",
+          ios: true,
+          android: true,
+        },
+      ],
+    ],
+  },
+};
+```
+
+Set `NITROPUSH_DEPLOYMENT_KEY` in the private environment used by local
+prebuilds and CI/EAS builds. Do **not** prefix it with `EXPO_PUBLIC_`: Expo
+inlines public variables into the JavaScript bundle. You may choose another
+private variable name with `deploymentKeyEnvVar`; the default is
+`NITROPUSH_DEPLOYMENT_KEY`.
+
+```sh
+NITROPUSH_DEPLOYMENT_KEY="<environment-deployment-key>" npx expo prebuild
+```
+
+Run a native rebuild after prebuild. Changing the deployment credential,
+bundle-signing settings, or delta-update setting requires another prebuild and
+native rebuild; a Metro reload cannot change native metadata.
+
 ### Android — `MainApplication.kt`
 
 Call `NitroPushSdk.install(this)` as the very first line of `onCreate`:
@@ -225,22 +266,37 @@ The CLI fetches the previous release bundle, runs `bsdiff`, and uploads the patc
 
 ### Enable on the SDK
 
-Both sides must opt in. Set `enableDeltaUpdates: true` in your config:
+Both sides must opt in. For Expo, set the flag in the config plugin while the
+deployment credential continues to come from the private build environment:
+
+```js
+// app.config.js
+module.exports = {
+  expo: {
+    plugins: [["@nitropush/react-native", {
+      deploymentKeyEnvVar: "NITROPUSH_DEPLOYMENT_KEY",
+      enableDeltaUpdates: true,
+    }]],
+  },
+};
+```
+
+Then run `npx expo prebuild` and rebuild the native app. To test the full-bundle
+path, set `enableDeltaUpdates: false` (or remove it), prebuild, and rebuild
+again. The JavaScript bootstrap stays the same in both builds:
 
 ```ts
-// Via native config (Info.plist / AndroidManifest — recommended)
-// iOS Info.plist:
-// <key>NITROPUSH_ENABLE_DELTA_UPDATES</key><true/>
-// Android AndroidManifest.xml:
-// <meta-data android:name="NITROPUSH_ENABLE_DELTA_UPDATES" android:value="true" />
+const client = configure();
+```
 
-// Or override at runtime:
-const client = configureWith({
-  serverUrl: "https://api.nitropush.org",
-  deploymentKey: "YOUR_DEPLOYMENT_KEY",
-  storageBaseUrl: "https://cdn.nitropush.org",
-  enableDeltaUpdates: true,   // ← opt in
-});
+For bare React Native, set the equivalent native flag:
+
+```xml
+<!-- iOS Info.plist -->
+<key>NITROPUSH_ENABLE_DELTA_UPDATES</key><true/>
+
+<!-- Android AndroidManifest.xml -->
+<meta-data android:name="NITROPUSH_ENABLE_DELTA_UPDATES" android:value="true" />
 ```
 
 When enabled, every update check sends `?currentBundleHash=<sha256>` so the server knows which base bundle the device has. If a matching patch exists in the manifest, the SDK downloads the patch, verifies its SHA-256, applies it natively via `bspatch`, verifies the output hash matches the new bundle, and installs. On any failure it transparently retries with the full bundle.
@@ -253,15 +309,18 @@ When enabled, every update check sends `?currentBundleHash=<sha256>` so the serv
 
 ## Explicit JS config
 
-Use `configureWith` when you need to override the native config at runtime (e.g. pointing at a staging server from a debug build):
+Use `configureWith` only when a self-hosted server or custom CDN requires
+explicit URLs at runtime. Its values are present in the JavaScript bundle, so do
+not use it to move a hosted deployment credential into an `EXPO_PUBLIC_*`
+variable:
 
 ```ts
 import { configureWith } from "@nitropush/react-native";
 
 const client = configureWith({
-  serverUrl: "https://api.nitropush.org",
-  deploymentKey: "YOUR_DEPLOYMENT_KEY",
-  storageBaseUrl: "https://cdn.nitropush.org",
+  serverUrl: "https://updates.self-hosted.example",
+  deploymentKey: getSelfHostedRuntimeCredential(),
+  storageBaseUrl: "https://cdn.self-hosted.example",
 });
 ```
 

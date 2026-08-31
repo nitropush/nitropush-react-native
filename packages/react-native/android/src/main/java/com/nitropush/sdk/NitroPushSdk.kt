@@ -198,8 +198,10 @@ class NitroPushSdk private constructor(
     /** Experimental: when true, send currentBundleHash in update checks and
      *  attempt delta download/patch before falling back to full bundle. */
     private var enableDeltaUpdates: Boolean = false
+    private data class EmbeddedBundleSource(val assetName: String, val sha256: String)
+
     /** SHA-256 of the JS bundle packaged in the APK/AAB, used before the first OTA. */
-    private val embeddedBundleHash: String? by lazy {
+    private val embeddedBundleSource: EmbeddedBundleSource? by lazy {
         val names = listOf("index.android.bundle", "main.jsbundle", "main.hbc")
         for (name in names) {
             val digest = runCatching {
@@ -214,9 +216,18 @@ class NitroPushSdk private constructor(
                 }
                 md.digest().joinToString("") { "%02x".format(it) }
             }.getOrNull()
-            if (digest != null) return@lazy digest
+            if (digest != null) return@lazy EmbeddedBundleSource(name, digest)
         }
         null
+    }
+    private val embeddedBundleHash: String?
+        get() = embeddedBundleSource?.sha256
+
+    /** Never advertise the embedded bundle while an OTA package is active,
+     *  even if that package is missing its stored bundle hash. */
+    private fun currentBundleHashForDelta(): String? {
+        val active = readActive()
+        return if (active != null) active.bundleHash else embeddedBundleHash
     }
 
     private val progressListeners = mutableMapOf<Int, (NPDownloadProgress) -> Unit>()
@@ -388,6 +399,26 @@ class NitroPushSdk private constructor(
             deviceToken?.let { connection.setRequestProperty("x-nitropush-device-token", it) }
         }
         return connection
+    }
+
+    /** Resolve an API-issued delta URL and constrain it to the configured
+     * HTTPS API origin before the device proof header is attached. */
+    private fun validatedDeltaDownloadUrl(raw: String): URL {
+        val api = serverUrl?.let(::URL)
+            ?: error("NitroPushSdk.configure(...) was not called.")
+        check(raw.isNotBlank()) { "delta download URL is invalid" }
+        val resolved = runCatching { URL(api, raw.trim()) }
+            .getOrElse { error("delta download URL is invalid") }
+        val validated = validatedNetworkUrl(
+            resolved.toString(),
+            "delta download URL",
+            allowQuery = true,
+        )
+        check(validated.protocol.equals("https", ignoreCase = true) &&
+            sameOrigin(validated, api)) {
+            "delta download URL must use the configured HTTPS API origin"
+        }
+        return validated
     }
 
     private fun readBounded(input: java.io.InputStream, maximumBytes: Int): ByteArray {
@@ -813,7 +844,7 @@ class NitroPushSdk private constructor(
             params["currentReleaseId"] = active.releaseId
         }
         if (enableDeltaUpdates) {
-            (active?.bundleHash ?: embeddedBundleHash)?.let { params["currentBundleHash"] = it }
+            currentBundleHashForDelta()?.let { params["currentBundleHash"] = it }
         }
 
         val query = params.entries.joinToString("&") {
@@ -898,6 +929,9 @@ class NitroPushSdk private constructor(
                         patchSize = r.getInt("deltaSizeBytes"),
                         patchSha256 = r.getString("deltaPatchSha256"),
                         algorithm = r.optString("deltaAlgorithm", "bsdiff4"),
+                        deltaDownloadUrl = r.optString("deltaDownloadUrl")
+                            .trim()
+                            .takeIf { it.isNotEmpty() },
                     )
                 } else null,
             )
@@ -1195,12 +1229,12 @@ class NitroPushSdk private constructor(
                 algorithm = it.optString("algorithm", "bsdiff4"),
             )
         }
-        val activeBundleHash = readActive()?.bundleHash
+        val currentBundleHash = currentBundleHashForDelta()
         val canUseDelta = enableDeltaUpdates &&
             selectedDelta != null &&
-            activeBundleHash != null &&
+            currentBundleHash != null &&
             selectedDelta.algorithm == "bsdiff4" &&
-            activeBundleHash == selectedDelta.fromBundleHash
+            currentBundleHash == selectedDelta.fromBundleHash
 
         var usedDelta = false
         if (canUseDelta) {
@@ -1211,6 +1245,7 @@ class NitroPushSdk private constructor(
                     patchSize = selectedDelta.patchSize,
                     fromBundleHash = selectedDelta.fromBundleHash,
                     expectedOutputSha256 = bundleSha256,
+                    deltaDownloadUrl = selectedDelta.deltaDownloadUrl,
                     dest = bundleDest,
                 )
                 usedDelta = true
@@ -1345,9 +1380,66 @@ class NitroPushSdk private constructor(
     }
 
     /**
-     * Download a bsdiff4 patch, verify its hash, apply it against the cached
-     * base bundle using the JNI bspatch wrapper, verify the output hash, then
-     * write the patched file to [dest].
+     * Snapshot the bundle that is actually running and verify that its bytes
+     * exactly match [expectedHash]. Before the first OTA this materializes the
+     * APK/AAB asset; afterwards only the active OTA bundle is eligible. A
+     * historical content-cache entry alone is deliberately not trusted.
+     */
+    private fun materializeDeltaBase(expectedHash: String): File {
+        check(Regex("^[a-f0-9]{64}$").matches(expectedHash)) { "delta base hash is invalid" }
+        val snapshot = File.createTempFile("nitropush-base-", ".bundle", applicationContext.cacheDir)
+        try {
+            val active = readActive()
+            if (active != null) {
+                check(active.bundleHash == expectedHash) {
+                    "active bundle does not match the delta base"
+                }
+                val releaseDir = releaseDirectory(applicationContext, active.releaseId)
+                val activeFile = File(active.bundlePath).canonicalFile
+                check(
+                    activeFile.path.startsWith(releaseDir.path + File.separator) &&
+                        activeFile.isFile &&
+                        activeFile.length() in 1..maxBundleBytes
+                ) { "active delta base is outside its release directory" }
+                activeFile.copyTo(snapshot, overwrite = true)
+            } else {
+                val embedded = embeddedBundleSource
+                check(embedded != null && embedded.sha256 == expectedHash) {
+                    "embedded bundle does not match the delta base"
+                }
+                applicationContext.assets.open(embedded.assetName).use { input ->
+                    snapshot.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(256 * 1024)
+                        var written = 0L
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            written += count
+                            check(written <= maxBundleBytes) {
+                                "delta base size is outside the allowed range"
+                            }
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+            }
+
+            check(snapshot.isFile && snapshot.length() in 1..maxBundleBytes) {
+                "delta base size is outside the allowed range"
+            }
+            check(sha256Hex(snapshot) == expectedHash) { "delta base hash mismatch" }
+            check(isHermesBundle(snapshot)) { "delta base is not a valid Hermes bundle" }
+            return snapshot
+        } catch (error: Throwable) {
+            snapshot.delete()
+            throw error
+        }
+    }
+
+    /**
+     * Download a bsdiff4 patch, verify its hash, apply it against an exact
+     * snapshot of the currently running bundle using the JNI bspatch wrapper,
+     * verify the output hash, then write the patched file to [dest].
      *
      * Throws on any failure — the caller falls back to full bundle download.
      */
@@ -1357,40 +1449,54 @@ class NitroPushSdk private constructor(
         patchSize: Int,
         fromBundleHash: String,
         expectedOutputSha256: String,
+        deltaDownloadUrl: String?,
         dest: File,
     ) {
+        check(Regex("^[a-f0-9]{64}$").matches(patchSha256) &&
+            patchSize.toLong() in 1..maxBundleBytes) {
+            "delta patch metadata is invalid"
+        }
         val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
-        val baseCached = File(cache, fromBundleHash)
-        check(baseCached.exists()) { "base bundle not in cache: $fromBundleHash" }
+        val baseSnapshot = materializeDeltaBase(fromBundleHash)
 
-        val patchUrl = resolveObjectUrl(patchObjectKey)
-        val tmpPatch = File.createTempFile("nitropush-patch-", ".bsdiff", applicationContext.cacheDir)
         try {
-            downloadToFile(
-                patchUrl,
-                tmpPatch,
-                expectedSha256 = patchSha256,
-                announcedSize = patchSize.toLong(),
-                maximumBytes = maxBundleBytes,
-            )
+            val protectedUrl = deltaDownloadUrl?.let(::validatedDeltaDownloadUrl)
+            val patchUrl = protectedUrl?.toString() ?: resolveObjectUrl(patchObjectKey)
+            val tmpPatch = File.createTempFile("nitropush-patch-", ".bsdiff", applicationContext.cacheDir)
+            try {
+                downloadToFile(
+                    patchUrl,
+                    tmpPatch,
+                    expectedSha256 = patchSha256,
+                    announcedSize = patchSize.toLong(),
+                    maximumBytes = maxBundleBytes,
+                    includeDeviceToken = protectedUrl != null,
+                )
 
-            val rc = BspatchJni.patch(baseCached.absolutePath, tmpPatch.absolutePath, dest.absolutePath)
-            check(rc == 0) { "bspatch failed with code $rc" }
+                val rc = BspatchJni.patch(
+                    baseSnapshot.absolutePath,
+                    tmpPatch.absolutePath,
+                    dest.absolutePath,
+                )
+                check(rc == 0) { "bspatch failed with code $rc" }
 
-            // Verify output integrity.
-            val actualDigest = java.security.MessageDigest.getInstance("SHA-256").digest(dest.readBytes())
-            val actualSha256 = actualDigest.joinToString("") { "%02x".format(it) }
-            check(actualSha256 == expectedOutputSha256) {
-                "patched bundle hash mismatch (expected $expectedOutputSha256 got $actualSha256)"
-            }
+                // Verify output integrity.
+                val actualSha256 = sha256Hex(dest)
+                check(actualSha256 == expectedOutputSha256) {
+                    "patched bundle hash mismatch (expected $expectedOutputSha256 got $actualSha256)"
+                }
+                check(isHermesBundle(dest)) { "patched file is not a valid Hermes bundle" }
 
-            // Copy verified output into the content-hash cache for future use.
-            val cachedOutput = File(cache, expectedOutputSha256)
-            if (!cachedOutput.exists()) {
-                dest.copyTo(cachedOutput, overwrite = false)
+                // Copy verified output into the content-hash cache for future use.
+                val cachedOutput = File(cache, expectedOutputSha256)
+                if (!cachedOutput.exists()) {
+                    dest.copyTo(cachedOutput, overwrite = false)
+                }
+            } finally {
+                tmpPatch.delete()
             }
         } finally {
-            tmpPatch.delete()
+            baseSnapshot.delete()
         }
     }
 
@@ -1401,9 +1507,14 @@ class NitroPushSdk private constructor(
         expectedSha256: String,
         announcedSize: Long,
         maximumBytes: Long,
+        includeDeviceToken: Boolean = false,
     ) {
         val safeUrl = validatedNetworkUrl(url, "asset download URL", allowQuery = true)
-        val conn = openConnection(safeUrl, readTimeoutMs = 5 * 60_000)
+        val conn = openConnection(
+            safeUrl,
+            includeDeviceToken = includeDeviceToken,
+            readTimeoutMs = 5 * 60_000,
+        )
         try {
             val code = conn.responseCode
             if (code !in 200..299) {

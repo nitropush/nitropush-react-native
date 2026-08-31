@@ -47,7 +47,7 @@
  *       "plugins": [
  *         ["@nitropush/react-native", {
  *           "serverUrl": "https://nitropush.example.com",
- *           "deploymentKey": "nl_live_...",
+ *           "deploymentKeyEnvVar": "NITROPUSH_DEPLOYMENT_KEY",
  *           "storageBaseUrl": "https://cdn.example.com/bundles",
  *           "bundlePublicKey": "BASE64_DER_PUBLIC_KEY",
  *           "requireBundleSigning": true,
@@ -56,9 +56,9 @@
  *     }
  *   }
  *
- * `serverUrl` / `deploymentKey` / `storageBaseUrl` are optional: if omitted
- * the native configure+update-check block is skipped and you call
- * `configure()` from JS instead.
+ * `deploymentKeyEnvVar` defaults to `NITROPUSH_DEPLOYMENT_KEY`. Resolving the
+ * value inside the plugin keeps it out of Expo's public config and JS bundle.
+ * `serverUrl` / `storageBaseUrl` are optional for hosted apps.
  *
  * Network security (ATS / NSExceptionDomains on iOS, network_security_config
  * on Android) is the host app's responsibility and is intentionally NOT
@@ -124,7 +124,17 @@ import {
      */
     serverUrl?: string;
     /** Deployment key for the target environment. Required when `serverUrl` is set. */
+    /**
+     * Deployment credential written into native configuration. Prefer
+     * `deploymentKeyEnvVar`; an inline value is retained for compatibility but
+     * becomes part of Expo's public config.
+     */
     deploymentKey?: string;
+    /**
+     * Name of the private build environment variable containing the
+     * deployment credential. Defaults to `NITROPUSH_DEPLOYMENT_KEY`.
+     */
+    deploymentKeyEnvVar?: string;
     /**
      * Object-storage base URL for bundle downloads (e.g. your MinIO / S3
      * bucket URL). Injected into Info.plist / AndroidManifest.
@@ -162,15 +172,38 @@ import {
     nativeConfigure?: boolean;
   }
   
+  export function resolveDeploymentKey(
+    props: Pick<NitroPushPluginProps, "deploymentKey" | "deploymentKeyEnvVar"> | void,
+    environment: NodeJS.ProcessEnv = process.env,
+  ): { deploymentKey: string; deploymentKeyEnvVar: string } {
+    const deploymentKeyEnvVar =
+      props?.deploymentKeyEnvVar?.trim() || "NITROPUSH_DEPLOYMENT_KEY";
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(deploymentKeyEnvVar)) {
+      throw new Error(
+        "[@nitropush/react-native] deploymentKeyEnvVar must be an environment variable name.",
+      );
+    }
+
+    return {
+      deploymentKey:
+        props?.deploymentKey?.trim() ||
+        environment[deploymentKeyEnvVar]?.trim() ||
+        "",
+      deploymentKeyEnvVar,
+    };
+  }
+
   const withNitroPush: ConfigPlugin<NitroPushPluginProps | void> = (
     config,
     props,
   ) => {
+    const resolvedDeployment = resolveDeploymentKey(props);
     const opts: Required<NitroPushPluginProps> = {
       ios: props?.ios ?? true,
       android: props?.android ?? true,
       serverUrl: props?.serverUrl ?? "",
-      deploymentKey: props?.deploymentKey ?? "",
+      deploymentKey: resolvedDeployment.deploymentKey,
+      deploymentKeyEnvVar: resolvedDeployment.deploymentKeyEnvVar,
       storageBaseUrl: props?.storageBaseUrl ?? "",
       bundlePublicKey: props?.bundlePublicKey ?? "",
       requireBundleSigning: props?.requireBundleSigning ?? false,

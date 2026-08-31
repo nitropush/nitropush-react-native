@@ -48,6 +48,9 @@ public struct NPDeltaPatch {
     public let patchSize: Int
     public let patchSha256: String
     public let algorithm: String
+    /// Optional API-issued, device-bound patch URL. Hosted clients prefer
+    /// this over direct object storage and send their device proof header.
+    public let deltaDownloadUrl: String?
 }
 
 public struct NPRemotePackage {

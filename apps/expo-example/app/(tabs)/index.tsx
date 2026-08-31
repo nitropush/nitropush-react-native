@@ -5,19 +5,14 @@ import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 
 import {
-  configure,
   InstallMode,
   sync,
   SyncStatus,
   type DownloadProgress,
   type LocalPackage,
 } from "@nitropush/react-native";
+import { nitropushClient as client } from "@/lib/nitropush";
 
-
-// Build the client once at module scope.
-// Expo apps read serverUrl / deploymentKey / storageBaseUrl from native
-// Info.plist / AndroidManifest values injected by the config plugin.
-const client = configure();
 
 export default function HomeScreen() {
   // First-paint reads via the sync helper — avoids a microtask hop so the

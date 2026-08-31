@@ -34,6 +34,8 @@ data class NPDeltaPatch(
     val patchSize: Int,
     val patchSha256: String,
     val algorithm: String,
+    /** Optional API-issued, device-bound patch URL. */
+    val deltaDownloadUrl: String? = null,
 )
 
 data class NPRemotePackage(

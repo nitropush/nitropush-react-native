@@ -6,6 +6,7 @@ import {
   patchAppDelegateSwift,
   patchExpoPodfile,
   patchMainApplicationKotlin,
+  resolveDeploymentKey,
   validateBundlePublicKey,
 } from "../plugin/build/index.js";
 
@@ -94,4 +95,35 @@ test("plugin validates a canonical P-256 SPKI and rejects malformed/wrong-curve 
   assert.doesNotThrow(() => validateBundlePublicKey(p256));
   assert.throws(() => validateBundlePublicKey("not base64"), /base64 DER/);
   assert.throws(() => validateBundlePublicKey(p384), /P-256/);
+});
+
+test("plugin resolves deployment credentials from a private build variable", () => {
+  assert.deepEqual(
+    resolveDeploymentKey(undefined, { NITROPUSH_DEPLOYMENT_KEY: "  test-key  " }),
+    {
+      deploymentKey: "test-key",
+      deploymentKeyEnvVar: "NITROPUSH_DEPLOYMENT_KEY",
+    },
+  );
+  assert.deepEqual(
+    resolveDeploymentKey(
+      { deploymentKeyEnvVar: "CUSTOM_NITROPUSH_KEY" },
+      { CUSTOM_NITROPUSH_KEY: "custom-key" },
+    ),
+    {
+      deploymentKey: "custom-key",
+      deploymentKeyEnvVar: "CUSTOM_NITROPUSH_KEY",
+    },
+  );
+  assert.equal(
+    resolveDeploymentKey(
+      { deploymentKey: "inline-key", deploymentKeyEnvVar: "CUSTOM_KEY" },
+      { CUSTOM_KEY: "environment-key" },
+    ).deploymentKey,
+    "inline-key",
+  );
+  assert.throws(
+    () => resolveDeploymentKey({ deploymentKeyEnvVar: "BAD-NAME" }, {}),
+    /environment variable name/,
+  );
 });

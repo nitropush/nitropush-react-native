@@ -20,7 +20,6 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
     },
@@ -42,14 +41,7 @@
           }
         }
       ],
-      [
-        "@nitropush/react-native",
-        {
-          "deploymentKey": "REPLACE_WITH_DEPLOYMENT_KEY",
-          "ios": true,
-          "android": true
-        }
-      ]
+      "./plugins/with-nitropush-native"
     ],
     "experiments": {
       "typedRoutes": true,
