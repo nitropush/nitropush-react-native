@@ -1246,7 +1246,7 @@ public final class NitroPushSdk {
 
         // Experimental delta path: attempt patch application, fall back to full download.
         var usedDelta = false
-        if enableDeltaUpdates,
+        if enableDeltaUpdates, pkg.kind != "nativescript",
            let delta = pkg.delta ?? manifest.bundle.delta?.toPlain(),
            delta.algorithm == "bsdiff4",
            let currentBundleHash = currentBundleHashForDelta(),
@@ -1284,6 +1284,24 @@ public final class NitroPushSdk {
             }
         }
 
+        var filePatchBytes = 0, filePatchFullBytes = 0
+        var filePatchFailed = false
+        func tryFileDelta(_ path: String, _ hash: String, _ size: Int?, _ patch: SdkFileDelta?, _ dest: URL, _ maximum: Int) async -> Bool {
+            guard pkg.kind == "nativescript", bundlePublicKey != nil, let patch, let size else { return false }
+            do {
+                guard try await applyNativeScriptFileDelta(path: path, hash: hash, size: size, patch: patch, dest: dest, maximumBytes: maximum) else { return false }
+                filePatchBytes += patch.patchSize; filePatchFullBytes += size
+                return true
+            } catch {
+                filePatchFailed = true
+                log("NativeScript file delta failed; downloading full file", path)
+                try? FileManager.default.removeItem(at: dest)
+                return false
+            }
+        }
+        if !usedDelta {
+            usedDelta = await tryFileDelta(manifest.bundle.originalPath, manifest.bundle.sha256, manifest.bundle.size, manifest.bundle.fileDelta, bundleDest, Self.maxBundleBytes)
+        }
         var installedBytes = 0
         if !usedDelta {
             let bundleDownloadUrl: String
@@ -1322,6 +1340,9 @@ public final class NitroPushSdk {
             } else {
                 assetDownloadUrl = try resolveObjectURL(asset.objectKey).absoluteString
             }
+            if await tryFileDelta(asset.originalPath, asset.sha256, asset.size, asset.fileDelta, dest, Self.maxAssetBytes) {
+                installedBytes += asset.size ?? 0
+            } else {
             installedBytes += try await fetchByContentHash(
                 urlString: assetDownloadUrl,
                 sha256: asset.sha256,
@@ -1329,6 +1350,7 @@ public final class NitroPushSdk {
                 announcedSize: asset.size ?? -1,
                 maximumBytes: Self.maxAssetBytes
             )
+            }
             guard installedBytes <= Self.maxReleaseBytes else {
                 throw NitroPushError.integrityFailure("release content exceeds the allowed size")
             }
@@ -1347,9 +1369,51 @@ public final class NitroPushSdk {
 
         if pkg.kind == "nativescript" {
             try manifestData.write(to: releaseDir.appendingPathComponent("verified-manifest.json"), options: .atomic)
+            if filePatchFullBytes > 0 {
+                log("NativeScript file deltas applied", "patchBytes=\(filePatchBytes) fullBytes=\(filePatchFullBytes) savedBytes=\(filePatchFullBytes - filePatchBytes)")
+                emit(type: "download_delta_applied", releaseId: pkg.releaseId, appVersion: pkg.appVersion, otaVersion: pkg.otaVersion,
+                    metadata: NlEventMetadata(patchSizeBytes: filePatchBytes, fullSizeBytes: filePatchFullBytes, savedBytes: filePatchFullBytes - filePatchBytes))
+            }
+            if filePatchFailed { emit(type: "download_delta_failed", releaseId: pkg.releaseId, appVersion: pkg.appVersion, otaVersion: pkg.otaVersion, metadata: NlEventMetadata(reason: "file_patch_fallback")) }
         }
         writeReleaseFilesManifest(releaseDir: releaseDir, hashes: Array(cachedHashes))
         return bundleDest.path
+    }
+
+    private func applyNativeScriptFileDelta(path: String, hash: String, size: Int, patch: SdkFileDelta, dest: URL, maximumBytes: Int) async throws -> Bool {
+        guard let active = readActive(), active.releaseId == patch.baseReleaseId,
+              active.appVersion == appVersion else { return false }
+        guard patch.algorithm == "npdiff1", patch.fromSha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              patch.patchSha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              patch.patchSize >= 12, patch.patchSize < size, size <= maximumBytes else {
+            throw NitroPushError.integrityFailure("invalid file delta metadata")
+        }
+        let root = try Self.releaseDirectory(for: active.releaseId).resolvingSymlinksInPath()
+        let source = root.appendingPathComponent(path).standardizedFileURL
+        guard path.hasPrefix("app/"), source.path.hasPrefix(root.path + "/"), source.resolvingSymlinksInPath().path == source.path else {
+            throw NitroPushError.integrityFailure("file delta base path is invalid")
+        }
+        let values = try source.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true, let sourceSize = values.fileSize, sourceSize > 0, sourceSize <= maximumBytes else {
+            throw NitroPushError.integrityFailure("file delta base size is invalid")
+        }
+        let base = try Data(contentsOf: source)
+        guard base.count == sourceSize, SHA256.hash(data: base).map({ String(format: "%02x", $0) }).joined() == patch.fromSha256 else {
+            throw NitroPushError.integrityFailure("file delta base hash mismatch")
+        }
+        let patchURL = try patch.downloadUrl.map { try Self.validatedNetworkURL($0, name: "file delta URL", allowQuery: true) } ?? resolveObjectURL(patch.objectKey)
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("nitropush-file-\(UUID().uuidString).npdiff")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try await downloadToFile(url: patchURL, dest: temporary, expectedSha256: patch.patchSha256, announcedSize: patch.patchSize, maximumBytes: patch.patchSize)
+        let result = try NPFileDelta.apply(base: base, patch: Data(contentsOf: temporary), maximumBytes: maximumBytes)
+        guard result.count == size, SHA256.hash(data: result).map({ String(format: "%02x", $0) }).joined() == hash else {
+            throw NitroPushError.integrityFailure("reconstructed file hash mismatch")
+        }
+        try result.write(to: dest, options: .atomic)
+        let cache = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        try result.write(to: cache.appendingPathComponent(hash), options: .atomic)
+        return true
     }
 
     /// sha256-keyed disk cache, shared across releases. If `<cache>/<sha>` exists
@@ -1691,6 +1755,7 @@ private struct SdkManifestBundle: Decodable {
     let signature: String?
     /// Experimental: bsdiff4 patch against a previous bundle.
     let delta: SdkManifestBundleDelta?
+    let fileDelta: SdkFileDelta?
 }
 
 private struct SdkManifestAsset: Decodable {
@@ -1700,6 +1765,17 @@ private struct SdkManifestAsset: Decodable {
     let objectKey: String
     let size: Int?
     /// Pre-signed download URL returned by the manifest proxy endpoint.
+    let downloadUrl: String?
+    let fileDelta: SdkFileDelta?
+}
+
+private struct SdkFileDelta: Decodable {
+    let algorithm: String
+    let baseReleaseId: String
+    let fromSha256: String
+    let patchSha256: String
+    let patchSize: Int
+    let objectKey: String
     let downloadUrl: String?
 }
 

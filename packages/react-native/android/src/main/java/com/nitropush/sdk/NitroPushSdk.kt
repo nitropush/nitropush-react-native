@@ -1282,7 +1282,7 @@ class NitroPushSdk private constructor(
             )
         }
         val currentBundleHash = currentBundleHashForDelta()
-        val canUseDelta = enableDeltaUpdates &&
+        val canUseDelta = enableDeltaUpdates && pkg.kind != "nativescript" &&
             selectedDelta != null &&
             currentBundleHash != null &&
             selectedDelta.algorithm == "bsdiff4" &&
@@ -1328,6 +1328,27 @@ class NitroPushSdk private constructor(
             }
         }
 
+        var filePatchBytes = 0
+        var filePatchFullBytes = 0
+        var filePatchFailed = false
+        fun tryFileDelta(entry: JSONObject, dest: File, maximum: Long): Boolean {
+            if (pkg.kind != "nativescript" || bundlePublicKey == null || !entry.has("fileDelta")) return false
+            return try {
+                val patch = entry.getJSONObject("fileDelta")
+                if (!applyNativeScriptFileDelta(entry, patch, dest, maximum)) false
+                else {
+                    filePatchBytes += patch.getInt("patchSize")
+                    filePatchFullBytes += entry.getInt("size")
+                    true
+                }
+            } catch (_: Throwable) {
+                filePatchFailed = true
+                log("NativeScript file delta failed; downloading full file") { entry.getString("originalPath") }
+                dest.delete()
+                false
+            }
+        }
+        if (!usedDelta) usedDelta = tryFileDelta(bundleObj, bundleDest, maxBundleBytes)
         var installedBytes = 0L
         if (!usedDelta) {
             val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
@@ -1354,12 +1375,8 @@ class NitroPushSdk private constructor(
             val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(objectKey)
             val dest = assetDestinations[i].also { it.parentFile?.mkdirs() }
-            installedBytes += fetchByContentHash(
-                assetDownloadUrl,
-                sha256,
-                dest,
-                size,
-                maxAssetBytes,
+            installedBytes += if (tryFileDelta(a, dest, maxAssetBytes)) size else fetchByContentHash(
+                assetDownloadUrl, sha256, dest, size, maxAssetBytes,
             )
             check(installedBytes <= maxReleaseBytes) { "release content exceeds the allowed size" }
             cachedHashes.add(sha256)
@@ -1378,9 +1395,48 @@ class NitroPushSdk private constructor(
             "bundle changed while assets were installed"
         }
 
-        if (pkg.kind == "nativescript") File(releaseDir, "verified-manifest.json").writeText(manifestText)
+        if (pkg.kind == "nativescript") {
+            File(releaseDir, "verified-manifest.json").writeText(manifestText)
+            if (filePatchFullBytes > 0) {
+                log("NativeScript file deltas applied") { "patchBytes=$filePatchBytes fullBytes=$filePatchFullBytes savedBytes=${filePatchFullBytes - filePatchBytes}" }
+                emit(type = "download_delta_applied", releaseId = pkg.releaseId, appVersion = pkg.appVersion, otaVersion = pkg.otaVersion,
+                    metadata = JSONObject().put("patchSizeBytes", filePatchBytes).put("fullSizeBytes", filePatchFullBytes).put("savedBytes", filePatchFullBytes - filePatchBytes))
+            }
+            if (filePatchFailed) emit(type = "download_delta_failed", releaseId = pkg.releaseId, appVersion = pkg.appVersion, otaVersion = pkg.otaVersion,
+                metadata = JSONObject().put("reason", "file_patch_fallback"))
+        }
         writeReleaseFilesManifest(releaseDir, cachedHashes)
         return bundleDest.absolutePath
+    }
+
+    private fun applyNativeScriptFileDelta(entry: JSONObject, patch: JSONObject, dest: File, maximum: Long): Boolean {
+        val active = readActive() ?: return false
+        if (active.releaseId != patch.getString("baseReleaseId") || active.appVersion != appVersion) return false
+        val size = entry.getInt("size")
+        val patchSize = patch.getInt("patchSize")
+        val fromHash = patch.getString("fromSha256")
+        val patchHash = patch.getString("patchSha256")
+        check(patch.getString("algorithm") == "npdiff1" && Regex("^[a-f0-9]{64}$").matches(fromHash) &&
+            Regex("^[a-f0-9]{64}$").matches(patchHash) && patchSize >= 12 && patchSize < size && size.toLong() <= maximum) { "Invalid file delta metadata" }
+        val root = releaseDirectory(applicationContext, active.releaseId)
+        val path = entry.getString("originalPath")
+        val source = File(root, path)
+        check(path.startsWith("app/") && source.canonicalPath == source.absolutePath &&
+            source.canonicalPath.startsWith(root.canonicalPath + File.separator) && source.isFile && source.length() in 1..maximum) { "Invalid file delta base path or size" }
+        val base = source.readBytes()
+        fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        check(base.size.toLong() <= maximum && hash(base) == fromHash) { "File delta base hash mismatch" }
+        val url = patch.optString("downloadUrl").takeIf { it.isNotEmpty() } ?: resolveObjectUrl(patch.getString("objectKey"))
+        val temporary = File.createTempFile("nitropush-file-", ".npdiff", applicationContext.cacheDir)
+        try {
+            downloadToFile(url, temporary, patchHash, patchSize.toLong(), patchSize.toLong())
+            val result = NPFileDelta.apply(base, temporary.readBytes(), maximum.toInt())
+            check(result.size == size && hash(result) == entry.getString("sha256")) { "Reconstructed file hash mismatch" }
+            dest.writeBytes(result)
+            val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
+            File(cache, entry.getString("sha256")).writeBytes(result)
+            return true
+        } finally { temporary.delete() }
     }
 
     /**
