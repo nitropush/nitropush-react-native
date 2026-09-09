@@ -22,6 +22,8 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 
 import {
   configure,
+  sync,
+  InstallMode,
   type LocalPackage,
   type NitroPushClient,
 } from '@nitropush/react-native';
@@ -47,11 +49,12 @@ function Demo() {
   // gives us metadata before the first frame paints. Falls back to the
   // async helper afterwards in case the singleton wasn't ready yet on
   // the very first call (race with native bootstrap).
-  const [running] = useState<LocalPackage | null>(() =>
+  const [running, setRunning] = useState<LocalPackage | null>(() =>
     client.getUpdateMetadataSync(),
   );
   const [pending, setPending] = useState<LocalPackage | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     // This is the rollback health boundary: it runs only after React has
@@ -60,20 +63,25 @@ function Demo() {
   }, []);
 
   const refresh = useCallback(async () => {
+    setBusy(true);
+    setError(null);
     try {
-      const [r, p, u] = await Promise.all([
+      await sync(client, { installMode: InstallMode.ON_NEXT_RESTART }, (_status, failure) => {
+        if (failure) setError(failure.message);
+      });
+      const [r, p] = await Promise.all([
         client.getCurrentPackage(),
         client.getPendingPackage(),
-        client.checkForUpdate(),
       ]);
 
       setPending(p);
-      console.log('remote', u && u.label);
+      setRunning(r);
       console.log('running', r && r.label, 'pending', p && p.label);
-      setError(null);
     } catch (e) {
       console.log(e);
       setError(String(e));
+    } finally {
+      setBusy(false);
     }
   }, []);
 
@@ -91,7 +99,7 @@ function Demo() {
   return (
     <View style={[styles.root, { paddingTop: insets.top + 24 }]}>
       <Text style={styles.title}>NitroPush demo</Text>
-      <Text style={styles.subtitle}>native-driven</Text>
+      <Text style={styles.subtitle}>native-driven · Embedded v1</Text>
 
       <View style={styles.card}>
         <Text style={styles.label}>Running</Text>
@@ -112,8 +120,8 @@ function Demo() {
         ) : null}
       </View>
 
-      <Pressable style={styles.button} onPress={refresh}>
-        <Text style={styles.buttonLabel}>Refresh</Text>
+      <Pressable style={styles.button} disabled={busy} onPress={refresh}>
+        <Text style={styles.buttonLabel}>{busy ? 'Working…' : 'Refresh'}</Text>
       </Pressable>
 
       <Pressable
