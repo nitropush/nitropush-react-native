@@ -11,8 +11,6 @@ import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
-import com.facebook.react.ReactApplication
-import com.facebook.react.ReactNativeHost
 import org.json.JSONObject
 import android.util.Base64
 import java.io.ByteArrayOutputStream
@@ -721,6 +719,59 @@ class NitroPushSdk private constructor(
      * the binary-shipped bundle. Wire into the host React configuration —
      * NOT exposed through the Nitro bridge (it's a native-only call).
      */
+    /** NativeScript boot gate; verifies the full signed local tree before V8 starts. */
+    fun verifiedApplicationRoot(embeddedRoot: File): File? = runCatching {
+        val active = readActive() ?: return null
+        val key = bundlePublicKey ?: error("NativeScript requires signing")
+        check(active.appVersion == appVersion && active.appVersion != "*")
+        val root = releaseDirectory(applicationContext, active.releaseId)
+        val manifestFile = File(root, "verified-manifest.json")
+        check(manifestFile.length() in 1..(4 * 1024 * 1024))
+        val manifest = JSONObject(manifestFile.readText())
+        check(manifest.getInt("schemaVersion") == 4 && manifest.getString("kind") == "nativescript")
+        check(manifest.getString("releaseId") == active.releaseId)
+        check(manifest.getString("targetAppVersion") == appVersion)
+        check(manifest.getString("deploymentKeyHash") == deploymentKeyHash)
+        val platforms = manifest.getJSONArray("platforms")
+        check(platforms.length() == 1 && platforms.getString(0) == "android")
+        verifySignature(releaseIntegrityPayload(manifest), manifest.getString("releaseSignature"), key, "release envelope")
+        val entries = mutableListOf(manifest.getJSONObject("bundle"))
+        val assets = manifest.getJSONArray("assets")
+        check(assets.length() <= 10_000)
+        for (i in 0 until assets.length()) entries += assets.getJSONObject(i)
+        val occupied = mutableSetOf<String>()
+        val expected = mutableSetOf<String>()
+        for (entry in entries) {
+            val path = entry.getString("originalPath")
+            check(path.startsWith("app/"))
+            val file = safeReleaseDestination(path, root, occupied)
+            check(file.absolutePath == File(root, path).absolutePath && file.isFile)
+            check(file.length() == entry.getLong("size"))
+            val hash = file.inputStream().use { stream ->
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buffer = ByteArray(65536)
+                while (true) { val n = stream.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
+                digest.digest().joinToString("") { "%02x".format(it) }
+            }
+            check(hash == entry.getString("sha256"))
+            expected += path
+        }
+        val actual = File(root, "app").walkTopDown().onEnter { directory ->
+            check(directory.canonicalPath == directory.absolutePath) { "symlink in application tree" }; true
+        }.filter { file -> check(file.canonicalPath == file.absolutePath) { "symlink in application tree" }; file.isFile }.map { it.relativeTo(root).invariantSeparatorsPath }.toSet()
+        check(actual == expected)
+        for (path in listOf("app/package.json", "app/tns-java-classes.js")) {
+            val embedded = File(embeddedRoot, path)
+            val installed = File(root, path)
+            check(embedded.exists() == installed.exists())
+            if (embedded.exists()) check(embedded.readBytes().contentEquals(installed.readBytes()))
+        }
+        val main = JSONObject(File(root, "app/package.json").readText()).getString("main")
+        val candidates = if (main.endsWith(".js") || main.endsWith(".mjs")) listOf("app/$main") else listOf("app/$main.js", "app/$main.mjs")
+        check(manifest.getJSONObject("bundle").getString("originalPath") in candidates && candidates.count { it in expected } == 1)
+        root
+    }.getOrNull()
+
     fun activeBundleFile(): String? {
         val active = readActive() ?: return null
         val releaseDir = runCatching { releaseDirectory(applicationContext, active.releaseId) }
@@ -938,7 +989,7 @@ class NitroPushSdk private constructor(
             validateReleaseId(pkg.releaseId)
             manifestDeploymentKeyHash[pkg.releaseId] =
                 sha256Hex(key.toByteArray(Charsets.UTF_8))
-            check(pkg.kind == "expo" || pkg.kind == "codepush") { "unsupported release kind" }
+            check(NPHostRuntime.accepts(pkg.kind)) { "unsupported release kind" }
             check(pkg.packageSize.isFinite() && pkg.packageSize > 0 && pkg.packageSize <= maxBundleBytes) {
                 "release package size is invalid"
             }
@@ -973,6 +1024,7 @@ class NitroPushSdk private constructor(
 
     private fun performDownload(pkg: NPRemotePackage): NPLocalPackage {
         val releaseDir = releaseDirectory(applicationContext, pkg.releaseId)
+        check(listOfNotNull(readActive(), readPending(), readPrevious()).none { it.releaseId == pkg.releaseId }) { "cannot overwrite a referenced release" }
         if (releaseDir.exists()) releaseDir.deleteRecursively()
         check(releaseDir.mkdirs()) { "could not create release staging directory" }
 
@@ -1326,6 +1378,7 @@ class NitroPushSdk private constructor(
             "bundle changed while assets were installed"
         }
 
+        if (pkg.kind == "nativescript") File(releaseDir, "verified-manifest.json").writeText(manifestText)
         writeReleaseFilesManifest(releaseDir, cachedHashes)
         return bundleDest.absolutePath
     }
@@ -1771,17 +1824,7 @@ class NitroPushSdk private constructor(
     }
 
     private fun reloadBridge() {
-        Handler(Looper.getMainLooper()).post {
-            try {
-                val app = applicationContext as? Application ?: return@post
-                val host: ReactNativeHost = (app as? ReactApplication)?.reactNativeHost ?: return@post
-                if (host.hasInstance()) {
-                    host.reactInstanceManager.recreateReactContextInBackground()
-                }
-            } catch (_: Throwable) {
-                // Host app isn't a ReactApplication during early bootstrap.
-            }
-        }
+        NPHostRuntime.reload(applicationContext)
     }
 
     private fun binaryAppVersion(): String? = try {

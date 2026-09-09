@@ -2,9 +2,6 @@ import CryptoKit
 import Foundation
 import UIKit
 
-#if canImport(React)
-import React
-#endif
 
 /**
  * Plain iOS implementation of the NitroPush OTA core.
@@ -661,6 +658,57 @@ public final class NitroPushSdk {
     /// URL of the currently-active bundle, or `nil` when running the
     /// binary-shipped bundle. Wire into `AppDelegate.bundleURL()`.
     /// **NOT exposed via the Nitro bridge** — it's a native-only call.
+    /// NativeScript boot gate. No downloaded code runs until the complete local inventory verifies.
+    public func verifiedApplicationRoot(embeddedRoot: URL) -> URL? {
+        do {
+            guard let active = readActive(), let key = bundlePublicKey,
+                  active.appVersion == appVersion, active.appVersion != "*" else { return nil }
+            let root = try Self.releaseDirectory(for: active.releaseId).resolvingSymlinksInPath()
+            let manifestURL = root.appendingPathComponent("verified-manifest.json")
+            let size = try manifestURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard size > 0, size <= Self.maxManifestBytes else { return nil }
+            let manifest = try JSONDecoder().decode(SdkManifest.self, from: Data(contentsOf: manifestURL))
+            guard manifest.schemaVersion == 4, manifest.kind == "nativescript",
+                  manifest.releaseId == active.releaseId,
+                  manifest.targetAppVersion == appVersion,
+                  manifest.deploymentKeyHash == deploymentKeyHash,
+                  manifest.platforms == ["ios"], let signature = manifest.releaseSignature else { return nil }
+            try Self.verifySignature(message: try Self.releaseIntegrityPayload(manifest),
+                signatureBase64: signature, publicKeyBase64: key, description: "release envelope")
+            _ = try validateManifestLayout(manifest, releaseDir: root)
+            let entries = [(manifest.bundle.originalPath, manifest.bundle.sha256, manifest.bundle.size)] +
+                manifest.assets.map { ($0.originalPath, $0.sha256, $0.size) }
+            var expected = Set<String>()
+            for (path, hash, byteCount) in entries {
+                guard path.hasPrefix("app/") else { return nil }
+                let file = root.appendingPathComponent(path).standardizedFileURL
+                guard file.resolvingSymlinksInPath().path == file.path,
+                      try file.resourceValues(forKeys: [.fileSizeKey]).fileSize == byteCount,
+                      try Self.sha256Hex(of: file) == hash else { return nil }
+                expected.insert(path)
+            }
+            let app = root.appendingPathComponent("app")
+            guard let files = FileManager.default.enumerator(at: app, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return nil }
+            var actual = Set<String>()
+            for case let file as URL in files {
+                let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isSymbolicLink != true else { return nil }
+                if values.isRegularFile == true { actual.insert(String(file.path.dropFirst(root.path.count + 1))) }
+            }
+            guard actual == expected else { return nil }
+            for path in ["app/package.json", "app/tns-java-classes.js"] {
+                let embedded = try? Data(contentsOf: embeddedRoot.appendingPathComponent(path))
+                let installed = try? Data(contentsOf: root.appendingPathComponent(path))
+                guard embedded == installed else { return nil }
+            }
+            let package = try JSONSerialization.jsonObject(with: Data(contentsOf: app.appendingPathComponent("package.json"))) as? [String: Any]
+            guard let main = package?["main"] as? String else { return nil }
+            let candidates = main.hasSuffix(".js") || main.hasSuffix(".mjs") ? ["app/" + main] : ["app/" + main + ".js", "app/" + main + ".mjs"]
+            guard candidates.contains(manifest.bundle.originalPath), candidates.filter({ expected.contains($0) }).count == 1 else { return nil }
+            return root
+        } catch { return nil }
+    }
+
     public func activeBundleURL() -> URL? {
         guard let active = readActive() else { return nil }
         guard let releaseDir = try? Self.releaseDirectory(for: active.releaseId) else { return nil }
@@ -833,7 +881,7 @@ public final class NitroPushSdk {
         guard let pkg = parsed.release?.pkg else { return nil }
         try Self.validateReleaseId(pkg.releaseId)
         manifestDeploymentKeyHash[pkg.releaseId] = Self.sha256Hex(Data(key.utf8))
-        guard pkg.kind == "expo" || pkg.kind == "codepush" else {
+        guard NPHostRuntime.accepts(kind: pkg.kind) else {
             throw NitroPushError.integrityFailure("unsupported release kind")
         }
         guard pkg.packageSize.isFinite,
@@ -872,6 +920,12 @@ public final class NitroPushSdk {
 
     private func performDownload(_ pkg: NPRemotePackage) async throws -> NPLocalPackage {
         let dir = try Self.releaseDirectory(for: pkg.releaseId)
+        let defaults = UserDefaults.standard
+        for key in [DefaultsKey.active, DefaultsKey.previous, DefaultsKey.pending, DefaultsKey.unconfirmed] {
+            if let row = defaults.dictionary(forKey: key), row["releaseId"] as? String == pkg.releaseId {
+                throw NitroPushError.integrityFailure("cannot overwrite a referenced release")
+            }
+        }
         try? FileManager.default.removeItem(at: dir)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
@@ -1291,6 +1345,9 @@ public final class NitroPushSdk {
             throw NitroPushError.integrityFailure("bundle changed while assets were installed")
         }
 
+        if pkg.kind == "nativescript" {
+            try manifestData.write(to: releaseDir.appendingPathComponent("verified-manifest.json"), options: .atomic)
+        }
         writeReleaseFilesManifest(releaseDir: releaseDir, hashes: Array(cachedHashes))
         return bundleDest.path
     }
@@ -1794,7 +1851,7 @@ extension NitroPushSdk {
             // RCTTriggerReloadCommandListeners (React Native 0.71+). Prior to 0.71,
             // RCTReloadCommand was an ObjC class — that API no longer exists in
             // RN 0.81+ so the old NSClassFromString lookup silently returned nil.
-            _nitroPushTriggerReload()
+            NPHostRuntime.reload()
         }
     }
 
