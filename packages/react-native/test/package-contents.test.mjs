@@ -30,6 +30,8 @@ test("published archive contains every runtime entrypoint and native source", ()
       "package/android/src/main/java/com/nitropush/sdk/NitroPushSdk.kt",
       "package/android/src/main/cpp/bspatch/bspatch.c",
       "package/ios/bspatch/bspatch.c",
+      "package/ios/NPSequenceLedger.swift",
+      "package/android/src/main/java/com/nitropush/sdk/NPSequenceLedger.kt",
       "package/nitrogen/generated/android/NitroPushOnLoad.cpp",
       "package/nitrogen/generated/ios/NitroPushAutolinking.swift",
       "package/nitrogen/generated/shared/c++/HybridNitroPushSpec.cpp",
@@ -37,6 +39,11 @@ test("published archive contains every runtime entrypoint and native source", ()
 
     for (const entry of required) {
       assert.ok(entries.has(entry), `missing required package file: ${entry}`);
+    }
+    for (const file of ['package/ios/NitroPushSdk.swift', 'package/android/src/main/java/com/nitropush/sdk/NitroPushSdk.kt']) {
+      const source = execFileSync('tar', ['-xOzf', archive, file], { encoding: 'utf8' });
+      assert.match(source, /cannot overwrite a referenced release/);
+      assert.match(source, /validateSequenceReceipt/);
     }
   } finally {
     rmSync(workDir, { recursive: true, force: true });

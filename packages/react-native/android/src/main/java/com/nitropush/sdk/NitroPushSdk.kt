@@ -150,6 +150,16 @@ class NitroPushSdk private constructor(
 
     private val prefs: SharedPreferences =
         applicationContext.getSharedPreferences("nitropush", Context.MODE_PRIVATE)
+    private val sequenceReceiptName = ".nitropush-sequence.json"
+    private val sequenceLedger = NPSequenceLedger(load = { scope ->
+        prefs.getString("nitropush.sequenceHighWater.$scope", null)?.let {
+            val row = JSONObject(it)
+            NPSequenceStamp(row.getDouble("version"), row.getString("releaseId"))
+        }
+    }, save = { scope, stamp ->
+        check(prefs.edit().putString("nitropush.sequenceHighWater.$scope", JSONObject()
+            .put("version", stamp.version).put("releaseId", stamp.releaseId).toString()).commit()) { "cannot persist OTA sequence" }
+    })
 
     /**
      * Toggleable debug logging — off by default so production builds don't
@@ -293,6 +303,7 @@ class NitroPushSdk private constructor(
         deviceTokenStorageKey = tokenKey
         deviceToken = prefs.getString(tokenKey, null)
         bundlePublicKey = validatedPublicKey
+        seedAcceptedSequenceHistory()
         enableDeltaUpdates = config.enableDeltaUpdates
         // Pre-signed URLs are scoped to the response that created them and
         // must never survive a server/project reconfiguration.
@@ -630,7 +641,9 @@ class NitroPushSdk private constructor(
 
     fun clearUpdates() {
         log("clearUpdates") { "wiping prefs + ${File(applicationContext.filesDir, "nitropush").absolutePath}" }
-        prefs.edit().clear().apply()
+        // Explicit local rollback/reset must not erase signed anti-replay history.
+        prefs.edit().remove(Keys.ACTIVE).remove(Keys.PENDING).remove(Keys.PREVIOUS)
+            .remove(Keys.UNCONFIRMED).remove(Keys.PENDING_ROLLBACK_EVENT).apply()
         File(applicationContext.filesDir, "nitropush").deleteRecursively()
     }
 
@@ -814,13 +827,19 @@ class NitroPushSdk private constructor(
 
         val pendingJson = prefs.getString(Keys.PENDING, null)
         if (pendingJson != null) {
-            prefs.getString(Keys.ACTIVE, null)?.let { editor.putString(Keys.PREVIOUS, it) }
-            editor.putString(Keys.ACTIVE, pendingJson)
-            editor.remove(Keys.PENDING)
-            editor.putBoolean(Keys.UNCONFIRMED, true)
-            editor.apply()
-            persistFlag(JSONObject(pendingJson).getString("releaseId"), isFirstRun = true)
-            return
+            val valid = runCatching { validateSequenceReceipt(NPLocalPackage.fromJson(JSONObject(pendingJson))) }.isSuccess
+            if (valid) {
+                prefs.getString(Keys.ACTIVE, null)?.let { editor.putString(Keys.PREVIOUS, it) }
+                editor.putString(Keys.ACTIVE, pendingJson)
+                editor.remove(Keys.PENDING)
+                editor.putBoolean(Keys.UNCONFIRMED, true)
+                editor.apply()
+                persistFlag(JSONObject(pendingJson).getString("releaseId"), isFirstRun = true)
+                return
+            } else {
+                prefs.edit().remove(Keys.PENDING).apply()
+                // Still run the unconfirmed-active rollback below.
+            }
         }
 
         if (prefs.getBoolean(Keys.UNCONFIRMED, false)) {
@@ -856,7 +875,7 @@ class NitroPushSdk private constructor(
                     lastBackgroundedAt = System.currentTimeMillis()
                     pendingSuspend?.let {
                         log("lifecycle.onStop → activating ON_NEXT_SUSPEND") { "releaseId=${it.releaseId}" }
-                        activatePending()
+                        activateDeferred(it, reload = false)
                         pendingSuspend = null
                     }
                 }
@@ -869,14 +888,25 @@ class NitroPushSdk private constructor(
                     }
                     if (elapsed >= minMs) {
                         log("lifecycle.onStart → activating ON_NEXT_RESUME + reload") { "releaseId=${pkg.releaseId}" }
-                        persistPending(pkg)
-                        activatePending()
-                        reloadBridge()
+                        activateDeferred(pkg, reload = true)
                         pendingResume = null
                         pruneUnusedBundlesAndCache()
                     }
                 }
             })
+        }
+    }
+
+    private fun activateDeferred(pkg: NPLocalPackage, reload: Boolean) {
+        try {
+            persistPending(pkg)
+            activatePending()
+            if (reload) reloadBridge()
+        } catch (e: Exception) {
+            // A later verified download can supersede a deferred update.
+            // Do not crash a lifecycle callback or replace the active bundle.
+            if (readPending()?.releaseId == pkg.releaseId) prefs.edit().remove(Keys.PENDING).apply()
+            log("deferred update discarded", e)
         }
     }
 
@@ -1083,7 +1113,9 @@ class NitroPushSdk private constructor(
                 originalPath.none { it.code < 0x20 || it.code == 0x7f } &&
                 segments.none {
                     it.isEmpty() || it == "." || it == ".." ||
-                        it.lowercase(Locale.ROOT) == releaseFilesManifestName
+                        it.lowercase(Locale.ROOT) == releaseFilesManifestName ||
+                        it.lowercase(Locale.ROOT) == sequenceReceiptName ||
+                        it.lowercase(Locale.ROOT) == "verified-manifest.json"
                 }
         ) { "unsafe release path: $originalPath" }
         check(occupied.add(originalPath.lowercase(Locale.ROOT))) {
@@ -1125,7 +1157,7 @@ class NitroPushSdk private constructor(
         val label = manifest.getString("label")
         val otaVersion = manifest.getDouble("otaVersion")
         check(otaVersion.isFinite() && otaVersion > 0 && otaVersion % 1.0 == 0.0 &&
-            otaVersion <= Long.MAX_VALUE.toDouble()) {
+            otaVersion <= 9_007_199_254_740_991.0) {
             "signed release otaVersion is invalid"
         }
         check(manifest.has("isMandatory")) { "signed release mandatory flag is missing" }
@@ -1297,6 +1329,7 @@ class NitroPushSdk private constructor(
                     patchSize = selectedDelta.patchSize,
                     fromBundleHash = selectedDelta.fromBundleHash,
                     expectedOutputSha256 = bundleSha256,
+                    expectedOutputSize = bundleSize.toLong(),
                     deltaDownloadUrl = selectedDelta.deltaDownloadUrl,
                     dest = bundleDest,
                 )
@@ -1395,8 +1428,14 @@ class NitroPushSdk private constructor(
             "bundle changed while assets were installed"
         }
 
-        if (pkg.kind == "nativescript") {
+        if (bundlePublicKey != null) {
+            val scope = sequenceScope(manifest)
+            sequenceLedger.check(scope, manifest.getDouble("otaVersion"), pkg.releaseId, remember = true)
+            File(releaseDir, sequenceReceiptName).writeText(JSONObject().put("scope", scope)
+                .put("version", manifest.getDouble("otaVersion")).put("releaseId", pkg.releaseId).toString())
             File(releaseDir, "verified-manifest.json").writeText(manifestText)
+        }
+        if (pkg.kind == "nativescript") {
             if (filePatchFullBytes > 0) {
                 log("NativeScript file deltas applied") { "patchBytes=$filePatchBytes fullBytes=$filePatchFullBytes savedBytes=${filePatchFullBytes - filePatchBytes}" }
                 emit(type = "download_delta_applied", releaseId = pkg.releaseId, appVersion = pkg.appVersion, otaVersion = pkg.otaVersion,
@@ -1558,10 +1597,11 @@ class NitroPushSdk private constructor(
         patchSize: Int,
         fromBundleHash: String,
         expectedOutputSha256: String,
+        expectedOutputSize: Long,
         deltaDownloadUrl: String?,
         dest: File,
     ) {
-        check(Regex("^[a-f0-9]{64}$").matches(patchSha256) &&
+        check(expectedOutputSize in 0..maxBundleBytes && Regex("^[a-f0-9]{64}$").matches(patchSha256) &&
             patchSize.toLong() in 1..maxBundleBytes) {
             "delta patch metadata is invalid"
         }
@@ -1586,6 +1626,7 @@ class NitroPushSdk private constructor(
                     baseSnapshot.absolutePath,
                     tmpPatch.absolutePath,
                     dest.absolutePath,
+                    expectedOutputSize,
                 )
                 check(rc == 0) { "bspatch failed with code $rc" }
 
@@ -1767,13 +1808,68 @@ class NitroPushSdk private constructor(
             (responseBytes?.let { " responseBytes=$it" } ?: "")
     }
 
+    private fun sequenceScope(manifest: JSONObject): String =
+        sequenceScope(manifest.getString("deploymentKeyHash"), manifest.getString("targetAppVersion"))
+
+    private fun sequenceScope(keyHash: String, runtime: String): String = sha256Hex(
+        "$keyHash\u0000android\u0000$runtime".toByteArray(Charsets.UTF_8))
+
+    private fun validateSequenceReceipt(pkg: NPLocalPackage) {
+        val file = File(releaseDirectory(applicationContext, pkg.releaseId), sequenceReceiptName)
+        if (!file.exists()) {
+            check(bundlePublicKey == null) { "signed release has no verified sequence receipt" }
+            return
+        }
+        check(file.length() in 1..2048) { "invalid sequence receipt" }
+        val row = JSONObject(file.readText())
+        check(row.getString("releaseId") == pkg.releaseId && row.getDouble("version") == pkg.otaVersion) { "invalid sequence receipt" }
+        sequenceLedger.check(row.getString("scope"), row.getDouble("version"), pkg.releaseId)
+    }
+
+    private fun seedAcceptedSequenceHistory() {
+        val key = bundlePublicKey ?: return
+        val keyHash = deploymentKeyHash ?: return
+        for (pkg in listOfNotNull(readActive(), readPrevious(), readPending())) {
+            val root = releaseDirectory(applicationContext, pkg.releaseId)
+            val receipt = File(root, sequenceReceiptName)
+            val file = File(root, "verified-manifest.json")
+            if (!file.exists()) {
+                // Pre-ledger RN/Expo persisted accepted package metadata but
+                // not the envelope. Preserve that app-private runtime floor
+                // once; never seed from /latest or rebind after reconfigure.
+                if (receipt.exists()) continue
+                val version = pkg.otaVersion ?: continue
+                val scope = sequenceScope(keyHash, pkg.appVersion)
+                sequenceLedger.seedAccepted(scope, version, pkg.releaseId)
+                receipt.writeText(JSONObject().put("scope", scope).put("version", version)
+                    .put("releaseId", pkg.releaseId).toString())
+                continue
+            }
+            val manifest = runCatching {
+                check(file.length() in 1..maxManifestBytes)
+                val manifest = JSONObject(file.readText())
+                check(manifest.getInt("schemaVersion") == 4 && manifest.getString("releaseId") == pkg.releaseId &&
+                    manifest.getString("deploymentKeyHash") == deploymentKeyHash &&
+                    manifest.getString("targetAppVersion") == pkg.appVersion && manifest.getDouble("otaVersion") == pkg.otaVersion &&
+                    manifest.getJSONArray("platforms").let { platforms -> (0 until platforms.length()).any { platforms.getString(it) == "android" } } &&
+                    sha256Hex(File(pkg.bundlePath)) == manifest.getJSONObject("bundle").getString("sha256"))
+                verifySignature(releaseIntegrityPayload(manifest), manifest.getString("releaseSignature"), key, "release envelope")
+                manifest
+            }.getOrNull() ?: continue
+            // A failure to durably save the floor must fail configuration.
+            sequenceLedger.seedAccepted(sequenceScope(manifest), manifest.getDouble("otaVersion"), pkg.releaseId)
+        }
+    }
+
     private fun persistPending(pkg: NPLocalPackage) {
+        validateSequenceReceipt(pkg)
         prefs.edit().putString(Keys.PENDING, pkg.toJson().toString()).apply()
     }
 
     @Synchronized
     private fun activatePending() {
         val pendingJson = prefs.getString(Keys.PENDING, null) ?: return
+        validateSequenceReceipt(NPLocalPackage.fromJson(JSONObject(pendingJson)))
         val editor = prefs.edit()
         prefs.getString(Keys.ACTIVE, null)?.let { editor.putString(Keys.PREVIOUS, it) }
         editor.putString(Keys.ACTIVE, pendingJson)

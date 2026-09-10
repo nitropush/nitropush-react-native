@@ -86,6 +86,14 @@ public final class NitroPushSdk {
     /// Experimental: when true, send currentBundleHash in update checks and
     /// attempt delta download/patch before falling back to full bundle.
     private var enableDeltaUpdates: Bool = false
+    private static let sequenceReceiptName = ".nitropush-sequence.json"
+    private lazy var sequenceLedger = NPSequenceLedger(load: { scope in
+        guard let row = UserDefaults.standard.dictionary(forKey: "nitropush.sequenceHighWater." + scope) else { return nil }
+        guard let version = row["version"] as? Double, let releaseId = row["releaseId"] as? String else { throw NPSequenceLedger.Failure.storage }
+        return NPSequenceStamp(version: version, releaseId: releaseId)
+    }, save: { scope, stamp in
+        UserDefaults.standard.set(["version": stamp.version, "releaseId": stamp.releaseId], forKey: "nitropush.sequenceHighWater." + scope)
+    })
     /// SHA-256 of the JS bundle shipped in the native binary. Used as the
     /// first delta base before any OTA package is active.
     private lazy var embeddedBundleHash: String? = {
@@ -222,6 +230,7 @@ public final class NitroPushSdk {
         self.deviceTokenStorageKey = "nitropush.deviceToken.\(tokenScopeHash)"
         self.deviceToken = UserDefaults.standard.string(forKey: self.deviceTokenStorageKey!)
         self.bundlePublicKey = validatedPublicKey
+        try seedAcceptedSequenceHistory()
         self.enableDeltaUpdates = config.enableDeltaUpdates
         // These URLs are scoped to the previous API response. Never reuse
         // them after reconfiguration, even when a release id happens to
@@ -741,14 +750,21 @@ public final class NitroPushSdk {
         let defaults = UserDefaults.standard
         if let pendingDict = defaults.dictionary(forKey: DefaultsKey.pending),
            let pending = NPLocalPackage.fromDict(pendingDict) {
-            if let activeDict = defaults.dictionary(forKey: DefaultsKey.active) {
-                defaults.set(activeDict, forKey: DefaultsKey.previous)
+            do {
+                try validateSequenceReceipt(pending)
+                if let activeDict = defaults.dictionary(forKey: DefaultsKey.active) {
+                    defaults.set(activeDict, forKey: DefaultsKey.previous)
+                }
+                defaults.set(pendingDict, forKey: DefaultsKey.active)
+                defaults.removeObject(forKey: DefaultsKey.pending)
+                defaults.set(true, forKey: DefaultsKey.unconfirmed)
+                persistFlag(releaseId: pending.releaseId, isFirstRun: true)
+                return
+            } catch {
+                defaults.removeObject(forKey: DefaultsKey.pending)
+                // A rejected pending update must not bypass the failed-boot
+                // rollback sweep for the still-unconfirmed active update.
             }
-            defaults.set(pendingDict, forKey: DefaultsKey.active)
-            defaults.removeObject(forKey: DefaultsKey.pending)
-            defaults.set(true, forKey: DefaultsKey.unconfirmed)
-            persistFlag(releaseId: pending.releaseId, isFirstRun: true)
-            return
         }
 
         if defaults.bool(forKey: DefaultsKey.unconfirmed) {
@@ -784,7 +800,7 @@ public final class NitroPushSdk {
         if let pending = pendingSuspend {
             log("lifecycle.didEnterBackground → activating ON_NEXT_SUSPEND",
                 "releaseId=\(pending.releaseId)")
-            _ = try? activatePendingSync()
+            activateDeferred(pending, reload: false)
             pendingSuspend = nil
         }
     }
@@ -797,11 +813,23 @@ public final class NitroPushSdk {
         if elapsed >= minimum {
             log("lifecycle.willEnterForeground → activating ON_NEXT_RESUME + reload",
                 "releaseId=\(pkg.releaseId)")
-            try? persistPending(pkg)
-            _ = try? activatePendingSync()
-            reloadBridge()
+            activateDeferred(pkg, reload: true)
             pendingResumeAfterBackground = nil
             pruneUnusedBundlesAndCache()
+        }
+    }
+
+    private func activateDeferred(_ pkg: NPLocalPackage, reload: Bool) {
+        do {
+            try persistPending(pkg)
+            if try activatePendingSync() != nil, reload { reloadBridge() }
+        } catch {
+            // A later verified download can legitimately supersede this one.
+            // Keep the active bundle and do not reload after failed activation.
+            if readPending()?.releaseId == pkg.releaseId {
+                UserDefaults.standard.removeObject(forKey: DefaultsKey.pending)
+            }
+            log("deferred update discarded", error: error)
         }
     }
 
@@ -984,7 +1012,9 @@ public final class NitroPushSdk {
               !containsControl,
               !segments.contains(where: {
                   $0.isEmpty || $0 == "." || $0 == ".." ||
-                  $0.lowercased() == Self.releaseFilesManifestName
+                  $0.lowercased() == Self.releaseFilesManifestName ||
+                  $0.lowercased() == Self.sequenceReceiptName ||
+                  $0.lowercased() == "verified-manifest.json"
               }) else {
             throw NitroPushError.integrityFailure("unsafe release path: \(originalPath)")
         }
@@ -1079,7 +1109,8 @@ public final class NitroPushSdk {
               otaVersion.isFinite,
               otaVersion > 0,
               otaVersion.rounded(.towardZero) == otaVersion,
-              otaVersion <= Double(Int64.max),
+              otaVersion <= 9_007_199_254_740_991,
+              let canonicalOtaVersion = Int64(exactly: otaVersion),
               let label = manifest.label,
               let isMandatory = manifest.isMandatory,
               let bundleSize = manifest.bundle.size else {
@@ -1115,7 +1146,7 @@ public final class NitroPushSdk {
         for platform in sortedPlatforms { payload += field("platform", platform) }
         payload += field("runtimeVersion", targetAppVersion)
         payload += field("label", label)
-        payload += "otaVersion:\(Int64(otaVersion))\n"
+        payload += "otaVersion:\(canonicalOtaVersion)\n"
         payload += "mandatory:\(isMandatory ? 1 : 0)\n"
         payload += artifact(
             "bundle",
@@ -1255,6 +1286,7 @@ public final class NitroPushSdk {
                 try await applyDeltaPatch(
                     delta: delta,
                     expectedOutputSha256: manifest.bundle.sha256,
+                    expectedOutputSize: manifest.bundle.size,
                     dest: bundleDest
                 )
                 usedDelta = true
@@ -1367,8 +1399,14 @@ public final class NitroPushSdk {
             throw NitroPushError.integrityFailure("bundle changed while assets were installed")
         }
 
-        if pkg.kind == "nativescript" {
+        if bundlePublicKey != nil {
+            let scope = try sequenceScope(manifest)
+            try sequenceLedger.check(scope, manifest.otaVersion!, pkg.releaseId, remember: true)
+            let receipt: [String: Any] = ["scope": scope, "version": manifest.otaVersion!, "releaseId": pkg.releaseId]
+            try JSONSerialization.data(withJSONObject: receipt).write(to: releaseDir.appendingPathComponent(Self.sequenceReceiptName), options: .atomic)
             try manifestData.write(to: releaseDir.appendingPathComponent("verified-manifest.json"), options: .atomic)
+        }
+        if pkg.kind == "nativescript" {
             if filePatchFullBytes > 0 {
                 log("NativeScript file deltas applied", "patchBytes=\(filePatchBytes) fullBytes=\(filePatchFullBytes) savedBytes=\(filePatchFullBytes - filePatchBytes)")
                 emit(type: "download_delta_applied", releaseId: pkg.releaseId, appVersion: pkg.appVersion, otaVersion: pkg.otaVersion,
@@ -1619,9 +1657,12 @@ public final class NitroPushSdk {
     private func applyDeltaPatch(
         delta: NPDeltaPatch,
         expectedOutputSha256: String,
+        expectedOutputSize: Int?,
         dest: URL
     ) async throws {
-        guard delta.patchSha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+        guard let expectedOutputSize = expectedOutputSize,
+              expectedOutputSize >= 0, expectedOutputSize <= Self.maxBundleBytes,
+              delta.patchSha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
               delta.patchSize > 0,
               delta.patchSize <= Self.maxBundleBytes else {
             throw NitroPushError.integrityFailure("delta patch metadata is invalid")
@@ -1665,7 +1706,7 @@ public final class NitroPushSdk {
         let rc = base.path.withCString { basePath in
             tmpPatch.path.withCString { patch in
                 dest.path.withCString { out in
-                    _bspatch_apply(basePath, patch, out)
+                    _bspatch_apply(basePath, patch, out, UInt64(expectedOutputSize))
                 }
             }
         }
@@ -1781,7 +1822,78 @@ private struct SdkFileDelta: Decodable {
 
 extension NitroPushSdk {
 
+    private func sequenceScope(_ manifest: SdkManifest) throws -> String {
+        guard let keyHash = manifest.deploymentKeyHash, let runtime = manifest.targetAppVersion else { throw NPSequenceLedger.Failure.invalid }
+        return sequenceScope(keyHash: keyHash, runtime: runtime)
+    }
+
+    private func sequenceScope(keyHash: String, runtime: String) -> String {
+        // Deployment keys bind project/environment; their counter is per runtime,
+        // not per bundle kind. Never compare wildcard and exact counters globally.
+        return Self.sha256Hex(Data("\(keyHash)\u{0}ios\u{0}\(runtime)".utf8))
+    }
+
+    private func validateSequenceReceipt(_ pkg: NPLocalPackage) throws {
+        let file = try Self.releaseDirectory(for: pkg.releaseId).appendingPathComponent(Self.sequenceReceiptName)
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            // Legacy pending pointers can be consumed before configure. Newly
+            // downloaded signed packages must always have a verified receipt.
+            if bundlePublicKey != nil { throw NPSequenceLedger.Failure.invalid }
+            return
+        }
+        let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size > 0, size <= 2048,
+              let row = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any],
+              let scope = row["scope"] as? String, let version = row["version"] as? Double,
+              row["releaseId"] as? String == pkg.releaseId, version == pkg.otaVersion else { throw NPSequenceLedger.Failure.invalid }
+        try sequenceLedger.check(scope, version, pkg.releaseId)
+    }
+
+    private func seedAcceptedSequenceHistory() throws {
+        guard let key = bundlePublicKey, let keyHash = deploymentKeyHash else { return }
+        for pkg in [readActive(), readPrevious(), readPending()].compactMap({ $0 }) {
+            let root = try Self.releaseDirectory(for: pkg.releaseId)
+            let receipt = root.appendingPathComponent(Self.sequenceReceiptName)
+            let file = root.appendingPathComponent("verified-manifest.json")
+            if !FileManager.default.fileExists(atPath: file.path) {
+                // Pre-ledger RN/Expo kept accepted package metadata, but not
+                // the envelope. This is app-private installed state, never
+                // /latest input. Preserve its existing runtime floor once,
+                // bound to the first configured deployment; do not rebind on
+                // later configure calls. This does not claim to recover
+                // history already deleted by an old SDK.
+                if FileManager.default.fileExists(atPath: receipt.path) { continue }
+                guard let version = pkg.otaVersion else { continue }
+                let scope = sequenceScope(keyHash: keyHash, runtime: pkg.appVersion)
+                try sequenceLedger.seedAccepted(scope, version, pkg.releaseId)
+                try JSONSerialization.data(withJSONObject: ["scope": scope, "version": version, "releaseId": pkg.releaseId])
+                    .write(to: receipt, options: .atomic)
+                continue
+            }
+            var accepted: (String, Double)?
+            do {
+                let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                guard size > 0, size <= Self.maxManifestBytes else { continue }
+                let manifest = try JSONDecoder().decode(SdkManifest.self, from: Data(contentsOf: file))
+                guard manifest.schemaVersion == 4, manifest.releaseId == pkg.releaseId,
+                      manifest.deploymentKeyHash == deploymentKeyHash,
+                      manifest.targetAppVersion == pkg.appVersion,
+                      manifest.otaVersion == pkg.otaVersion,
+                      manifest.platforms?.contains("ios") == true,
+                      let signature = manifest.releaseSignature,
+                      try Self.sha256Hex(of: URL(fileURLWithPath: pkg.bundlePath)) == manifest.bundle.sha256 else { continue }
+                try Self.verifySignature(message: try Self.releaseIntegrityPayload(manifest), signatureBase64: signature, publicKeyBase64: key, description: "release envelope")
+                accepted = (try sequenceScope(manifest), manifest.otaVersion!)
+            } catch { /* Invalid envelopes cannot raise the signed floor. */ }
+            if let (scope, version) = accepted {
+                // Do not swallow a failure to durably save the accepted floor.
+                try sequenceLedger.seedAccepted(scope, version, pkg.releaseId)
+            }
+        }
+    }
+
     private func persistPending(_ pkg: NPLocalPackage) throws {
+        try validateSequenceReceipt(pkg)
         UserDefaults.standard.set(pkg.toDict(), forKey: DefaultsKey.pending)
     }
 
@@ -1790,6 +1902,7 @@ extension NitroPushSdk {
         let defaults = UserDefaults.standard
         guard let pendingDict = defaults.dictionary(forKey: DefaultsKey.pending),
               let pending = NPLocalPackage.fromDict(pendingDict) else { return nil }
+        try validateSequenceReceipt(pending)
         if let activeDict = defaults.dictionary(forKey: DefaultsKey.active) {
             defaults.set(activeDict, forKey: DefaultsKey.previous)
         }

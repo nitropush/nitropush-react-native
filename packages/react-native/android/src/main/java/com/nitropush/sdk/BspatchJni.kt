@@ -13,7 +13,7 @@ internal object BspatchJni {
      * @param outPath   Absolute path where the patched output should be written.
      * @return 0 on success, non-zero on failure.
      */
-    external fun patch(basePath: String, patchPath: String, outPath: String): Int
+    external fun patch(basePath: String, patchPath: String, outPath: String, expectedSize: Long): Int
 
     init {
         System.loadLibrary("NitroPush")

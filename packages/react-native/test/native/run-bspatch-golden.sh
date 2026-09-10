@@ -12,6 +12,7 @@ bspatch_include_dir="$3"
 package_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixtures_dir="${package_root}/test/delta-fixtures"
 expected_hash="$(awk '$2 == "new.bundle" { print $1 }' "${fixtures_dir}/SHA256SUMS")"
+expected_size="$(wc -c < "${fixtures_dir}/new.bundle" | tr -d ' ')"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/nitropush-${platform}-bspatch.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -38,7 +39,7 @@ assert_expected_hash() {
 "${tmp_dir}/bspatch-golden" \
   "${fixtures_dir}/old.bundle" \
   "${fixtures_dir}/old-to-new.bsdiff" \
-  "${tmp_dir}/new.bundle"
+  "${tmp_dir}/new.bundle" "${expected_size}"
 cmp "${fixtures_dir}/new.bundle" "${tmp_dir}/new.bundle"
 assert_expected_hash "${tmp_dir}/new.bundle"
 
@@ -47,7 +48,7 @@ printf 'X' | dd of="${tmp_dir}/corrupt.bsdiff" bs=1 seek=0 conv=notrunc status=n
 if "${tmp_dir}/bspatch-golden" \
   "${fixtures_dir}/old.bundle" \
   "${tmp_dir}/corrupt.bsdiff" \
-  "${tmp_dir}/corrupt-output.bundle"; then
+  "${tmp_dir}/corrupt-output.bundle" "${expected_size}"; then
   echo "${platform}: corrupt patch unexpectedly succeeded" >&2
   exit 1
 fi
@@ -56,7 +57,7 @@ wrong_base_rc=0
 "${tmp_dir}/bspatch-golden" \
   "${fixtures_dir}/wrong-base.bundle" \
   "${fixtures_dir}/old-to-new.bsdiff" \
-  "${tmp_dir}/wrong-base-output.bundle" || wrong_base_rc=$?
+  "${tmp_dir}/wrong-base-output.bundle" "${expected_size}" || wrong_base_rc=$?
 if [[ ${wrong_base_rc} -eq 0 ]] && assert_expected_hash "${tmp_dir}/wrong-base-output.bundle" 2>/dev/null; then
   echo "${platform}: wrong base unexpectedly produced the expected output hash" >&2
   exit 1

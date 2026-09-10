@@ -77,6 +77,17 @@ class AppDelegate: ExpoAppDelegate {
 }
 `;
 
+test("iOS configure block is removed when disabled or deployment key is removed", () => {
+  const source = expoAppDelegate.replace('  override func bundleURL()', '  func start() {\n    let delegate = ReactNativeDelegate()\n  }\n  override func bundleURL()');
+  const enabled = patchAppDelegateSwift(source, { nativeConfigure: true, deploymentKey: 'test-key' });
+  assert.match(enabled, /nitropush-ios-configure/);
+  for (const options of [{ nativeConfigure: false, deploymentKey: 'test-key' }, { nativeConfigure: true }]) {
+    const disabled = patchAppDelegateSwift(enabled, options);
+    assert.doesNotMatch(disabled, /nitropush-ios-configure|deploymentKey:\s+"test-key"/);
+    assert.equal(patchAppDelegateSwift(disabled, options), disabled);
+  }
+});
+
 test("iOS plugin never confirms an update from a native lifecycle callback", () => {
   const patched = patchAppDelegateSwift(expoAppDelegate);
 

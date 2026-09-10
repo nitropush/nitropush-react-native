@@ -44,7 +44,7 @@ struct NlAnalyticsEvent: Codable {
 /// **Threading.** All queue mutation goes through `serial` so callers (the
 /// Nitro bridge, lifecycle observers, the rollback sweep) can hammer
 /// `enqueue` from any thread without locking.
-final class NlAnalytics: NSObject, URLSessionTaskDelegate {
+final class NlAnalytics: NSObject, URLSessionDataDelegate {
     private let serverUrl: String
     private let deploymentKey: String
     private let capacity: Int
@@ -69,6 +69,7 @@ final class NlAnalytics: NSObject, URLSessionTaskDelegate {
     private var backoffMs: Int = 0
     private var flushTimer: DispatchSourceTimer?
     private var stopped = false
+    private var pendingBatches: [Int: [NlAnalyticsEvent]] = [:]
 
     init(
         serverUrl: String,
@@ -139,6 +140,35 @@ final class NlAnalytics: NSObject, URLSessionTaskDelegate {
 
     // MARK: - Private (must be called on `serial`)
 
+    // Telemetry acknowledgments need only the status. A completion-handler
+    // data task buffers the whole response, even when its Data is discarded.
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } == true
+        serial.async { [weak self] in self?.finishBatchLocked(dataTask.taskIdentifier, ok: ok) }
+        completionHandler(.cancel)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        serial.async { [weak self] in self?.finishBatchLocked(task.taskIdentifier, ok: false) }
+    }
+
+    private func finishBatchLocked(_ taskId: Int, ok: Bool) {
+        // Header cancellation and transport completion can both arrive.
+        guard let batch = pendingBatches.removeValue(forKey: taskId) else { return }
+        flushing = false
+        guard !stopped else { return }
+        if ok {
+            backoffMs = 0
+        } else {
+            queue.insert(contentsOf: batch, at: 0)
+            while queue.count > capacity { queue.removeFirst() }
+            backoffMs = min(max(backoffMs * 2, 1_000), 60_000)
+            scheduleRetryLocked()
+        }
+    }
+
     private func scheduleTimerLocked() {
         if flushTimer != nil { return }
         let timer = DispatchSource.makeTimerSource(queue: serial)
@@ -178,26 +208,9 @@ final class NlAnalytics: NSObject, URLSessionTaskDelegate {
             return
         }
 
-        session.dataTask(with: req) { [weak self] _, response, error in
-            guard let self = self else { return }
-            self.serial.async {
-                self.flushing = false
-                let ok = error == nil
-                    && (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } == true
-                if ok {
-                    self.backoffMs = 0
-                } else {
-                    // Re-queue the failed batch at the head, exponential
-                    // backoff up to 60s between retries.
-                    self.queue.insert(contentsOf: batch, at: 0)
-                    while self.queue.count > self.capacity {
-                        self.queue.removeFirst()
-                    }
-                    self.backoffMs = min(max(self.backoffMs * 2, 1_000), 60_000)
-                    self.scheduleRetryLocked()
-                }
-            }
-        }.resume()
+        let task = session.dataTask(with: req)
+        pendingBatches[task.taskIdentifier] = batch
+        task.resume()
     }
 
     private func scheduleRetryLocked() {

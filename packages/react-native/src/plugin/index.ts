@@ -451,6 +451,8 @@ import {
     // active, before React rendered. Remove that generated block during the
     // next prebuild so rollback remains armed until JS explicitly confirms.
     src = removeContents({ src, tag: TAG_IOS_NOTIFY_APP_READY }).contents;
+    // A later prebuild may disable native configuration or remove its key.
+    src = removeContents({ src, tag: TAG_IOS_CONFIGURE }).contents;
   
     // 1. import NitroPush — after the first import statement.
     src = mergeContents({

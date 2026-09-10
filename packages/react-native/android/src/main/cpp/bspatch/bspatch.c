@@ -25,168 +25,140 @@
  */
 
 #include "bspatch.h"
-
 #include <bzlib.h>
-#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int64_t offtin(uint8_t *buf)
-{
-    int64_t y;
-    y  = buf[7] & 0x7F;
-    y  = y * 256; y += buf[6];
-    y  = y * 256; y += buf[5];
-    y  = y * 256; y += buf[4];
-    y  = y * 256; y += buf[3];
-    y  = y * 256; y += buf[2];
-    y  = y * 256; y += buf[1];
-    y  = y * 256; y += buf[0];
-    if (buf[7] & 0x80) y = -y;
-    return y;
+/* Match the SDK's per-bundle limit, independently of untrusted patch headers. */
+#define MAX_BYTES (64U * 1024U * 1024U)
+#define MAX_CONTROL_TRIPLETS 1000000U
+
+static int64_t offtin(const uint8_t *buf) {
+    uint64_t value = buf[7] & 0x7f;
+    for (int i = 6; i >= 0; --i) value = value * 256 + buf[i];
+    return (buf[7] & 0x80) ? -(int64_t)value : (int64_t)value;
 }
 
-int bspatch_apply(const char *oldfile, const char *patchfile, const char *newfile)
-{
-    FILE *f, *cpf, *dpf, *epf;
-    BZFILE *cpfbz2, *dpfbz2, *epfbz2;
-    int cbz2err, dbz2err, ebz2err;
-    int fd;
-    ssize_t oldsize, newsize;
-    ssize_t bzctrllen, bzdatalen;
-    uint8_t header[32], buf[8];
-    uint8_t *old_data, *new_data;
-    int64_t oldpos, newpos;
-    int64_t ctrl[3];
-    int64_t lenread;
-    int64_t i;
+typedef struct { bz_stream bz; int initialized; int ended; } bounded_stream;
 
-    /* Open patch file */
-    if ((f = fopen(patchfile, "r")) == NULL) return 1;
-
-    /* Read header */
-    if (fread(header, 1, 32, f) < 32) { fclose(f); return 1; }
-
-    /* Check magic "BSDIFF40" */
-    if (memcmp(header, "BSDIFF40", 8) != 0) { fclose(f); return 1; }
-
-    /* Read lengths from header */
-    bzctrllen = offtin(header + 8);
-    bzdatalen = offtin(header + 16);
-    newsize   = offtin(header + 24);
-
-    if (bzctrllen < 0 || bzdatalen < 0 || newsize < 0) { fclose(f); return 1; }
-
-    /* Open three sub-streams at the right offsets */
-    if ((cpf = fopen(patchfile, "r")) == NULL) { fclose(f); return 1; }
-    if (fseeko(cpf, 32, SEEK_SET))             { fclose(f); fclose(cpf); return 1; }
-
-    if ((cpfbz2 = BZ2_bzReadOpen(&cbz2err, cpf, 0, 0, NULL, 0)) == NULL)
-        { fclose(f); fclose(cpf); return 1; }
-
-    if ((dpf = fopen(patchfile, "r")) == NULL)
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); fclose(f); fclose(cpf); return 1; }
-    if (fseeko(dpf, 32 + bzctrllen, SEEK_SET))
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); fclose(f); fclose(cpf); fclose(dpf); return 1; }
-
-    if ((dpfbz2 = BZ2_bzReadOpen(&dbz2err, dpf, 0, 0, NULL, 0)) == NULL)
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); fclose(f); fclose(cpf); fclose(dpf); return 1; }
-
-    if ((epf = fopen(patchfile, "r")) == NULL)
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-          fclose(f); fclose(cpf); fclose(dpf); return 1; }
-    if (fseeko(epf, 32 + bzctrllen + bzdatalen, SEEK_SET))
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-          fclose(f); fclose(cpf); fclose(dpf); fclose(epf); return 1; }
-
-    if ((epfbz2 = BZ2_bzReadOpen(&ebz2err, epf, 0, 0, NULL, 0)) == NULL)
-        { BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-          fclose(f); fclose(cpf); fclose(dpf); fclose(epf); return 1; }
-
-    fclose(f);
-
-    /* Read old file */
-    if ((f = fopen(oldfile, "r")) == NULL) {
-        BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-        BZ2_bzReadClose(&ebz2err, epfbz2);
-        fclose(cpf); fclose(dpf); fclose(epf); return 1;
-    }
-    if (fseeko(f, 0, SEEK_END)) { fclose(f); return 1; }
-    if ((oldsize = ftello(f)) == -1) { fclose(f); return 1; }
-    if (fseeko(f, 0, SEEK_SET)) { fclose(f); return 1; }
-
-    if ((old_data = malloc(oldsize + 1)) == NULL) { fclose(f); return 1; }
-    if (fread(old_data, 1, oldsize, f) != (size_t)oldsize) { free(old_data); fclose(f); return 1; }
-    fclose(f);
-
-    if ((new_data = malloc(newsize + 1)) == NULL) { free(old_data); return 1; }
-
-    oldpos = 0; newpos = 0;
-    while (newpos < newsize) {
-        /* Read control triplet */
-        for (i = 0; i <= 2; i++) {
-            lenread = BZ2_bzRead(&cbz2err, cpfbz2, buf, 8);
-            if ((lenread < 8) || ((cbz2err != BZ_OK) && (cbz2err != BZ_STREAM_END))) {
-                free(old_data); free(new_data);
-                BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-                BZ2_bzReadClose(&ebz2err, epfbz2);
-                fclose(cpf); fclose(dpf); fclose(epf); return 1;
-            }
-            ctrl[i] = offtin(buf);
-        }
-
-        /* Add old data */
-        if (newpos + ctrl[0] > newsize) {
-            free(old_data); free(new_data);
-            BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-            BZ2_bzReadClose(&ebz2err, epfbz2);
-            fclose(cpf); fclose(dpf); fclose(epf); return 1;
-        }
-        lenread = BZ2_bzRead(&dbz2err, dpfbz2, new_data + newpos, ctrl[0]);
-        if ((lenread < ctrl[0]) || ((dbz2err != BZ_OK) && (dbz2err != BZ_STREAM_END))) {
-            free(old_data); free(new_data);
-            BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-            BZ2_bzReadClose(&ebz2err, epfbz2);
-            fclose(cpf); fclose(dpf); fclose(epf); return 1;
-        }
-        for (i = 0; i < ctrl[0]; i++) {
-            if ((oldpos + i >= 0) && (oldpos + i < oldsize))
-                new_data[newpos + i] += old_data[oldpos + i];
-        }
-        newpos += ctrl[0]; oldpos += ctrl[0];
-
-        /* Copy extra data */
-        if (newpos + ctrl[1] > newsize) {
-            free(old_data); free(new_data);
-            BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-            BZ2_bzReadClose(&ebz2err, epfbz2);
-            fclose(cpf); fclose(dpf); fclose(epf); return 1;
-        }
-        lenread = BZ2_bzRead(&ebz2err, epfbz2, new_data + newpos, ctrl[1]);
-        if ((lenread < ctrl[1]) || ((ebz2err != BZ_OK) && (ebz2err != BZ_STREAM_END))) {
-            free(old_data); free(new_data);
-            BZ2_bzReadClose(&cbz2err, cpfbz2); BZ2_bzReadClose(&dbz2err, dpfbz2);
-            BZ2_bzReadClose(&ebz2err, epfbz2);
-            fclose(cpf); fclose(dpf); fclose(epf); return 1;
-        }
-        newpos += ctrl[1]; oldpos += ctrl[2];
-    }
-
-    BZ2_bzReadClose(&cbz2err, cpfbz2);
-    BZ2_bzReadClose(&dbz2err, dpfbz2);
-    BZ2_bzReadClose(&ebz2err, epfbz2);
-    fclose(cpf); fclose(dpf); fclose(epf);
-
-    /* Write output */
-    if ((f = fopen(newfile, "w")) == NULL) { free(old_data); free(new_data); return 1; }
-    if (fwrite(new_data, 1, newsize, f) != (size_t)newsize) {
-        free(old_data); free(new_data); fclose(f); return 1;
-    }
-    fclose(f);
-
-    free(old_data);
-    free(new_data);
+static int stream_open(bounded_stream *s, uint8_t *bytes, size_t count) {
+    if (count > UINT_MAX || BZ2_bzDecompressInit(&s->bz, 0, 0) != BZ_OK) return 1;
+    s->initialized = 1;
+    s->bz.next_in = (char *)bytes;
+    s->bz.avail_in = (unsigned int)count;
     return 0;
+}
+
+/* Each stream sees only its declared compressed segment. */
+static int stream_read(bounded_stream *s, uint8_t *out, size_t count) {
+    if (!count) return 0;
+    if (s->ended || count > INT_MAX) return 1;
+    s->bz.next_out = (char *)out;
+    s->bz.avail_out = (unsigned int)count;
+    while (s->bz.avail_out) {
+        unsigned int input = s->bz.avail_in, output = s->bz.avail_out;
+        int rc = BZ2_bzDecompress(&s->bz);
+        if (rc == BZ_STREAM_END) {
+            s->ended = 1;
+            return s->bz.avail_out != 0;
+        }
+        if (rc != BZ_OK || (input == s->bz.avail_in && output == s->bz.avail_out)) return 1;
+    }
+    return 0;
+}
+
+static int stream_finish(bounded_stream *s) {
+    if (!s->ended) {
+        uint8_t extra;
+        /* Finish the checksum/trailer, but reject any unconsumed output. */
+        s->bz.next_out = (char *)&extra;
+        s->bz.avail_out = 1;
+        int rc = BZ2_bzDecompress(&s->bz);
+        if (rc != BZ_STREAM_END || s->bz.avail_out != 1) return 1;
+        s->ended = 1;
+    }
+    return s->bz.avail_in != 0;
+}
+
+static int read_file(const char *path, uint8_t **data, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+    int rc = 1;
+    if (fseeko(f, 0, SEEK_END)) goto done;
+    off_t length = ftello(f);
+    if (length < 0 || (uint64_t)length > MAX_BYTES || fseeko(f, 0, SEEK_SET)) goto done;
+    *size = (size_t)length;
+    *data = malloc(*size ? *size : 1);
+    if (!*data || fread(*data, 1, *size, f) != *size) goto done;
+    rc = 0;
+done:
+    fclose(f);
+    return rc;
+}
+
+static int add_checked(int64_t a, int64_t b, int64_t *result) {
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return 1;
+    *result = a + b;
+    return 0;
+}
+
+int bspatch_apply(const char *oldfile, const char *patchfile, const char *newfile,
+                  uint64_t expected_size) {
+    uint8_t *patch = NULL, *old = NULL, *output = NULL;
+    size_t patch_size = 0, old_size = 0;
+    bounded_stream streams[3] = {0};
+    int rc = 1;
+    FILE *f = NULL;
+    if (expected_size > MAX_BYTES) goto done;
+    if (read_file(patchfile, &patch, &patch_size) || patch_size < 32 ||
+        memcmp(patch, "BSDIFF40", 8)) goto done;
+    int64_t control_size = offtin(patch + 8), diff_size = offtin(patch + 16);
+    int64_t new_size = offtin(patch + 24);
+    if (control_size < 0 || diff_size < 0 || new_size < 0 ||
+        (uint64_t)new_size != expected_size ||
+        (uint64_t)control_size > patch_size - 32 ||
+        (uint64_t)diff_size > patch_size - 32 - (size_t)control_size) goto done;
+    size_t diff_offset = 32 + (size_t)control_size;
+    size_t extra_offset = diff_offset + (size_t)diff_size;
+    if (stream_open(&streams[0], patch + 32, (size_t)control_size) ||
+        stream_open(&streams[1], patch + diff_offset, (size_t)diff_size) ||
+        stream_open(&streams[2], patch + extra_offset, patch_size - extra_offset) ||
+        read_file(oldfile, &old, &old_size)) goto done;
+    output = malloc(expected_size ? (size_t)expected_size : 1);
+    if (!output) goto done;
+    int64_t old_pos = 0;
+    size_t new_pos = 0;
+    unsigned int operations = 0;
+    while (new_pos < expected_size) {
+        uint8_t bytes[24];
+        if (++operations > MAX_CONTROL_TRIPLETS || stream_read(&streams[0], bytes, 24)) goto done;
+        int64_t diff = offtin(bytes), extra = offtin(bytes + 8), seek = offtin(bytes + 16);
+        if (diff < 0 || extra < 0 || diff > INT_MAX || extra > INT_MAX ||
+            (uint64_t)diff > expected_size - new_pos ||
+            (uint64_t)extra > expected_size - new_pos - (size_t)diff) goto done;
+        int64_t after_diff, after_seek;
+        if (add_checked(old_pos, diff, &after_diff) || add_checked(after_diff, seek, &after_seek)) goto done;
+        if (stream_read(&streams[1], output + new_pos, (size_t)diff)) goto done;
+        for (int64_t i = 0; i < diff; ++i) {
+            int64_t index = old_pos + i; /* after_diff was checked before this loop */
+            if (index >= 0 && (uint64_t)index < old_size) output[new_pos + (size_t)i] += old[(size_t)index];
+        }
+        new_pos += (size_t)diff;
+        if (stream_read(&streams[2], output + new_pos, (size_t)extra)) goto done;
+        new_pos += (size_t)extra;
+        old_pos = after_seek; /* negative and seek-only controls remain valid */
+    }
+    for (int i = 0; i < 3; ++i) if (stream_finish(&streams[i])) goto done;
+    f = fopen(newfile, "wb");
+    if (!f) goto done;
+    if (fwrite(output, 1, (size_t)expected_size, f) != expected_size) goto done;
+    rc = 0;
+done:
+    if (f && fclose(f)) rc = 1;
+    for (int i = 0; i < 3; ++i) if (streams[i].initialized) BZ2_bzDecompressEnd(&streams[i].bz);
+    free(patch); free(old); free(output);
+    return rc;
 }

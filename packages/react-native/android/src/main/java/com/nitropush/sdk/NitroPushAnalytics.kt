@@ -170,8 +170,7 @@ internal class NPAnalytics(
             }
             conn.outputStream.use { it.write(body) }
             val code = conn.responseCode
-            // Drain so the JVM can pool the connection.
-            try { conn.inputStream.use { it.readBytes() } } catch (_: Throwable) {}
+            // The status is the entire protocol. Never buffer an untrusted body.
             code in 200..299
         } catch (_: Throwable) {
             false
