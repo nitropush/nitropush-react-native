@@ -75,6 +75,7 @@ import {
     withDangerousMod,
     withInfoPlist,
     withMainApplication,
+    withXcodeProject,
   } from "@expo/config-plugins";
   import { mergeContents, removeContents } from "@expo/config-plugins/build/utils/generateCode";
   import { createPublicKey } from "crypto";
@@ -276,6 +277,21 @@ import {
     }
 
     if (opts.ios) {
+      config = withXcodeProject(config, (cfg) => {
+        const phases = cfg.modResults.hash.project.objects.PBXShellScriptBuildPhase ?? {};
+        let patched = false;
+        for (const phase of Object.values(phases) as Array<{ shellScript?: string }>) {
+          if (typeof phase?.shellScript !== "string") continue;
+          const script = JSON.parse(phase.shellScript) as string;
+          if (!script.includes("react-native-xcode.sh")) continue;
+          phase.shellScript = JSON.stringify(patchEmbeddedAssetBuildPhase(script));
+          patched = true;
+        }
+        if (!patched) {
+          throw new Error("[@nitropush/react-native] Cannot find the iOS React Native bundle phase for embedded asset indexing.");
+        }
+        return cfg;
+      });
       config = withAppDelegate(config, (cfg) => {
         if (cfg.modResults.language !== "swift") {
           // Older Obj-C templates aren't supported by the auto-patcher.
@@ -331,6 +347,27 @@ import {
   
     return config;
   }; 
+
+  /** Runs after Metro/Hermes have written final resources into the .app bundle. */
+  export function patchEmbeddedAssetBuildPhase(source: string): string {
+    const tag = "nitropush-embedded-assets-v1";
+    if (source.includes(`# ${tag}`)) return source;
+    return source.trimEnd() + "\n\n" + [
+      `# ${tag}`,
+      'NITROPUSH_BUNDLE_STATUS=$?',
+      'if [ "$NITROPUSH_BUNDLE_STATUS" -ne 0 ]; then exit "$NITROPUSH_BUNDLE_STATUS"; fi',
+      'if [ "${SKIP_BUNDLING:-0}" != "1" ]; then',
+      '  if [ -z "${NODE_BINARY:-}" ]; then',
+      '    if [ -f "$PODS_ROOT/../.xcode.env" ]; then . "$PODS_ROOT/../.xcode.env"; fi',
+      '    if [ -f "$PODS_ROOT/../.xcode.env.local" ]; then . "$PODS_ROOT/../.xcode.env.local"; fi',
+      '  fi',
+      '  NITROPUSH_NODE_BINARY="${NODE_BINARY:-node}"',
+      '  NITROPUSH_INDEX_SCRIPT="$("$NITROPUSH_NODE_BINARY" --print "require.resolve(\'@nitropush/react-native/scripts/embedded-assets.cjs\')")"',
+      '  "$NITROPUSH_NODE_BINARY" "$NITROPUSH_INDEX_SCRIPT" --platform ios --bundle-root "$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"',
+      'fi',
+      "",
+    ].join("\n");
+  }
   
   // ─── iOS: Podfile Swift/C++ interop settings ─────────────────────────────────
 

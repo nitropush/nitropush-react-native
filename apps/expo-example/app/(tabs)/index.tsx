@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
+import { AssetTestPanel } from "@/components/asset-test-panel";
 
 import {
   InstallMode,
@@ -13,12 +14,11 @@ import {
 } from "@nitropush/react-native";
 import { nitropushClient as client } from "@/lib/nitropush";
 
-
 export default function HomeScreen() {
   // First-paint reads via the sync helper — avoids a microtask hop so the
   // metadata is available before the first frame paints.
   const [running, setRunning] = useState<LocalPackage | null>(() =>
-    client.getUpdateMetadataSync(),
+    client.getUpdateMetadataSync()
   );
   const [pending, setPending] = useState<LocalPackage | null>(null);
   const [statusLine, setStatusLine] = useState("idle");
@@ -56,7 +56,7 @@ export default function HomeScreen() {
         setStatusLine(SyncStatus[status]);
         if (err) setError(err.message);
       },
-      setProgress,
+      setProgress
     );
 
     // Refresh the pending pointer after the sync — UI gets the new label
@@ -69,58 +69,73 @@ export default function HomeScreen() {
   }, []);
 
   return (
-    <ThemedView style={styles.root}>
-      <ThemedText type="title">NitroPush demo</ThemedText>
-      <ThemedText style={styles.subtitle}>
-        Version: {meta?.displayVersion ?? meta?.label ?? "binary bundle"}
-      </ThemedText>
-
-      <View style={styles.card}>
-        <ThemedText style={styles.label}>Running</ThemedText>
-        <ThemedText style={styles.value}>
-          {running ? `${running.label} · ${running.appVersion}` : "binary bundle"}
+    <ScrollView contentInsetAdjustmentBehavior="automatic">
+      <ThemedView style={styles.root}>
+        <ThemedText type="title">NitroPush demo</ThemedText>
+        <ThemedText style={styles.subtitle}>
+          Version: {meta?.displayVersion ?? meta?.label ?? "binary bundle"}
         </ThemedText>
 
-        <ThemedText style={styles.label}>Pending</ThemedText>
-        <ThemedText style={styles.value}>
-          {pending ? `${pending.label} · ${pending.appVersion}` : "—"}
-        </ThemedText>
+        <View style={styles.card}>
+          <ThemedText style={styles.label}>Running</ThemedText>
+          <ThemedText style={styles.value}>
+            {running
+              ? `${running.label} · ${running.appVersion}`
+              : "binary bundle"}
+          </ThemedText>
 
-        <ThemedText style={styles.label}>Status</ThemedText>
-        <ThemedText style={styles.value}>{statusLine}</ThemedText>
+          <ThemedText style={styles.label}>Pending</ThemedText>
+          <ThemedText style={styles.value}>
+            {pending ? `${pending.label} · ${pending.appVersion}` : "—"}
+          </ThemedText>
 
-        <ThemedText style={styles.label}>Progress</ThemedText>
-        <ThemedText style={styles.value}>
-          {progress
-            ? `${progress.receivedBytes.toFixed(0)} / ${progress.totalBytes.toFixed(0)} bytes`
-            : "—"}
-        </ThemedText>
+          <ThemedText style={styles.label}>Status</ThemedText>
+          <ThemedText style={styles.value}>{statusLine}</ThemedText>
 
-        {error ? (
-          <>
-            <ThemedText style={styles.label}>Error</ThemedText>
-            <ThemedText style={[styles.value, styles.error]}>{error}</ThemedText>
-          </>
-        ) : null}
-      </View>
+          <ThemedText style={styles.label}>Progress</ThemedText>
+          <ThemedText style={styles.value}>
+            {progress
+              ? `${progress.receivedBytes.toFixed(
+                  0
+                )} / ${progress.totalBytes.toFixed(0)} bytes`
+              : "—"}
+          </ThemedText>
 
-      <Pressable style={styles.button} onPress={runSync}>
-        <ThemedText style={styles.buttonLabel}>Check for updates</ThemedText>
-      </Pressable>
+          {error ? (
+            <>
+              <ThemedText style={styles.label}>Error</ThemedText>
+              <ThemedText style={[styles.value, styles.error]}>
+                {error}
+              </ThemedText>
+            </>
+          ) : null}
+        </View>
 
-      <Pressable
-        style={[styles.button, styles.secondaryButton, !pending && styles.disabledButton]}
-        disabled={!pending}
-        onPress={applyPending}
-      >
-        <ThemedText style={styles.buttonLabel}>Apply pending update</ThemedText>
-      </Pressable>
-    </ThemedView>
+        <Pressable style={styles.button} onPress={runSync}>
+          <ThemedText style={styles.buttonLabel}>Check for updates</ThemedText>
+        </Pressable>
+
+        <Pressable
+          style={[
+            styles.button,
+            styles.secondaryButton,
+            !pending && styles.disabledButton,
+          ]}
+          disabled={!pending}
+          onPress={applyPending}
+        >
+          <ThemedText style={styles.buttonLabel}>
+            Apply pending update
+          </ThemedText>
+        </Pressable>
+        <AssetTestPanel />
+      </ThemedView>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, padding: 24, gap: 8 },
+  root: { padding: 24, gap: 8 },
   subtitle: { opacity: 0.6, fontFamily: "Menlo", marginBottom: 4 },
   card: {
     padding: 16,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import {
   patchAppDelegateSwift,
@@ -8,7 +9,18 @@ import {
   patchMainApplicationKotlin,
   resolveDeploymentKey,
   validateBundlePublicKey,
+  patchEmbeddedAssetBuildPhase,
 } from "../plugin/build/index.js";
+
+test("iOS embedded inventory hook follows bundling, is idempotent, and preserves bundle failure", () => {
+  const source = 'echo "react-native-xcode.sh"\nfalse';
+  const patched = patchEmbeddedAssetBuildPhase(source);
+  assert.equal(patchEmbeddedAssetBuildPhase(patched), patched);
+  assert(patched.indexOf('react-native-xcode.sh') < patched.indexOf('embedded-assets.cjs'));
+  assert.match(patched, /CONFIGURATION_BUILD_DIR\/\$UNLOCALIZED_RESOURCES_FOLDER_PATH/);
+  assert.equal(spawnSync('/bin/sh', ['-n', '-c', patched]).status, 0);
+  assert.equal(spawnSync('/bin/sh', ['-c', patched]).status, 1);
+});
 
 const expo57MainApplication = `package org.nitropush.validation
 

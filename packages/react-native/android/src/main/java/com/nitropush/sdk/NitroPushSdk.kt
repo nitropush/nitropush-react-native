@@ -430,6 +430,11 @@ class NitroPushSdk private constructor(
         return validated
     }
 
+    private fun assetDownloadUrl(raw: String, expectedHash: String): Pair<URL, Boolean> {
+        val (resolved, isAssetProxy) = NPAssetDeliveryURL.resolve(raw, serverUrl?.let(::URL), expectedHash)
+        return validatedNetworkUrl(resolved.toString(), "asset download URL", allowQuery = true) to isAssetProxy
+    }
+
     private fun readBounded(input: java.io.InputStream, maximumBytes: Int): ByteArray {
         input.use { stream ->
             val output = ByteArrayOutputStream(minOf(maximumBytes, 64 * 1024))
@@ -1302,9 +1307,11 @@ class NitroPushSdk private constructor(
             )
         }
 
-        // Experimental delta path: attempt patch application, fall back to full download.
+        // A verified target is already complete: do not download even a smaller patch.
+        val cachedBundleSize = copyCachedContentHash(bundleSha256, bundleDest, bundleSize.toLong(), maxBundleBytes)
+        // Experimental delta path: cache miss -> patch -> full download fallback.
         val deltaObj = bundleObj.optJSONObject("delta")
-        val selectedDelta = pkg.delta ?: deltaObj?.let {
+        val selectedDelta = if (cachedBundleSize != null) null else pkg.delta ?: deltaObj?.let {
             NPDeltaPatch(
                 fromBundleHash = it.getString("fromBundleHash"),
                 patchObjectKey = it.getString("patchObjectKey"),
@@ -1313,8 +1320,8 @@ class NitroPushSdk private constructor(
                 algorithm = it.optString("algorithm", "bsdiff4"),
             )
         }
-        val currentBundleHash = currentBundleHashForDelta()
-        val canUseDelta = enableDeltaUpdates && pkg.kind != "nativescript" &&
+        val currentBundleHash = if (cachedBundleSize == null) currentBundleHashForDelta() else null
+        val canUseDelta = cachedBundleSize == null && enableDeltaUpdates && pkg.kind != "nativescript" &&
             selectedDelta != null &&
             currentBundleHash != null &&
             selectedDelta.algorithm == "bsdiff4" &&
@@ -1381,9 +1388,9 @@ class NitroPushSdk private constructor(
                 false
             }
         }
-        if (!usedDelta) usedDelta = tryFileDelta(bundleObj, bundleDest, maxBundleBytes)
-        var installedBytes = 0L
-        if (!usedDelta) {
+        if (cachedBundleSize == null && !usedDelta) usedDelta = tryFileDelta(bundleObj, bundleDest, maxBundleBytes)
+        var installedBytes = cachedBundleSize ?: 0L
+        if (cachedBundleSize == null && !usedDelta) {
             val bundleDownloadUrl = bundleObj.optString("downloadUrl").takeIf { it.isNotEmpty() }
                 ?: resolveObjectUrl(bundleObjectKey)
             installedBytes += fetchByContentHash(
@@ -1393,7 +1400,7 @@ class NitroPushSdk private constructor(
                 bundleSize.toLong(),
                 maxBundleBytes,
             )
-        } else {
+        } else if (usedDelta) {
             installedBytes += bundleDest.length()
         }
         check(installedBytes <= maxReleaseBytes) { "release content exceeds the allowed size" }
@@ -1405,12 +1412,13 @@ class NitroPushSdk private constructor(
             val sha256 = a.getString("sha256")
             val size = a.optLong("size", -1)
             val objectKey = a.getString("objectKey")
-            val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
-                ?: resolveObjectUrl(objectKey)
             val dest = assetDestinations[i].also { it.parentFile?.mkdirs() }
-            installedBytes += if (tryFileDelta(a, dest, maxAssetBytes)) size else fetchByContentHash(
-                assetDownloadUrl, sha256, dest, size, maxAssetBytes,
-            )
+            installedBytes += copyCachedContentHash(sha256, dest, size, maxAssetBytes)
+                ?: if (tryFileDelta(a, dest, maxAssetBytes)) size else {
+                    val assetDownloadUrl = a.optString("downloadUrl").takeIf { it.isNotEmpty() }
+                        ?: resolveObjectUrl(objectKey)
+                    fetchByContentHash(assetDownloadUrl, sha256, dest, size, maxAssetBytes)
+                }
             check(installedBytes <= maxReleaseBytes) { "release content exceeds the allowed size" }
             cachedHashes.add(sha256)
 
@@ -1478,6 +1486,14 @@ class NitroPushSdk private constructor(
         } finally { temporary.delete() }
     }
 
+    private val embeddedAssets by lazy { NPEmbeddedAssets(applicationContext) }
+    private fun copyCachedContentHash(sha256: String, dest: File, announcedSize: Long, maximumBytes: Long): Long? {
+        val directory = File(applicationContext.filesDir, "nitropush/cache")
+        NPContentHashCache.copyVerified(directory, sha256, dest, announcedSize, maximumBytes)?.let { return it }
+        if (!embeddedAssets.populate(directory, sha256, announcedSize, maximumBytes)) return null
+        return NPContentHashCache.copyVerified(directory, sha256, dest, announcedSize, maximumBytes)
+    }
+
     /**
      * Cross-release content-addressable cache: a file with sha256 == hash
      * is kept at `nitropush/cache/<hash>`. If present, hardlink/copy to
@@ -1490,28 +1506,21 @@ class NitroPushSdk private constructor(
         announcedSize: Long,
         maximumBytes: Long,
     ): Long {
-        val cache = File(applicationContext.filesDir, "nitropush/cache").also { it.mkdirs() }
-        val cached = File(cache, sha256)
-        if (cached.exists()) {
-            if (sha256Hex(cached) != sha256 || cached.length() <= 0 || cached.length() > maximumBytes ||
-                (announcedSize > 0 && cached.length() != announcedSize)) {
-                cached.delete()
-            } else {
-                cached.setLastModified(System.currentTimeMillis())
-                cached.copyTo(dest, overwrite = true)
-                return dest.length()
-            }
-        }
+        copyCachedContentHash(sha256, dest, announcedSize, maximumBytes)?.let { return it }
+        val cached = NPContentHashCache.file(File(applicationContext.filesDir, "nitropush/cache"), sha256)
+        check(cached.parentFile!!.isDirectory || cached.parentFile!!.mkdirs()) { "cannot create content cache" }
+        val (downloadUrl, isAssetProxy) = assetDownloadUrl(url, sha256)
         downloadToFile(
-            url,
+            downloadUrl.toString(),
             cached,
             expectedSha256 = sha256,
             announcedSize = announcedSize,
             maximumBytes = maximumBytes,
+            includeDeviceToken = isAssetProxy,
         )
-        cached.copyTo(dest, overwrite = true)
-        check(dest.length() in 1..maximumBytes) { "download exceeds the allowed size" }
-        return dest.length()
+        return checkNotNull(copyCachedContentHash(sha256, dest, announcedSize, maximumBytes)) {
+            "downloaded cache content failed verification"
+        }
     }
 
     private fun sha256Hex(file: File): String {
@@ -1665,11 +1674,13 @@ class NitroPushSdk private constructor(
             includeDeviceToken = includeDeviceToken,
             readTimeoutMs = 5 * 60_000,
         )
+        if (includeDeviceToken && safeUrl.path == "/api/sdk/asset") conn.setRequestProperty("Accept-Encoding", "identity")
         try {
             val code = conn.responseCode
             if (code !in 200..299) {
                 error("download returned HTTP $code from ${redactedUrl(url)}")
             }
+            check(!includeDeviceToken || safeUrl.path != "/api/sdk/asset" || code == 200) { "asset proxy must return a complete response" }
             if (conn.contentLengthLong > maximumBytes ||
                 (announcedSize > 0 && conn.contentLengthLong > announcedSize)) {
                 error("download exceeds the allowed size")
@@ -1773,6 +1784,9 @@ class NitroPushSdk private constructor(
             parsed,
             includeDeviceToken = api != null && sameOrigin(parsed, api),
         )
+        if (api != null && sameOrigin(parsed, api) && parsed.protocol.equals("https", ignoreCase = true) && deviceToken != null) {
+            conn.setRequestProperty("x-nitropush-asset-delivery", "proxy-v1")
+        }
         try {
             val code = conn.responseCode
             if (code !in 200..299) {

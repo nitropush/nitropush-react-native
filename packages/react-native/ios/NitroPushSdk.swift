@@ -31,6 +31,7 @@ public final class NitroPushSdk {
     /// anywhere on the native side) when you want a trace of every SDK
     /// action. Process-local, no persistence.
     private var logsEnabled: Bool = false
+    private let embeddedAssets = NPEmbeddedAssets()
 
     /// Enable / disable debug logging at runtime. Idempotent.
     public func setEnableLogs(_ enabled: Bool) {
@@ -354,6 +355,15 @@ public final class NitroPushSdk {
             )
         }
         return try requestForAPIURL(validated)
+    }
+
+    private func assetDownloadRequest(_ raw: String, expectedHash: String) throws -> (URL, URLRequest?) {
+        let (resolved, isAssetProxy) = try NPAssetDeliveryURL.resolve(raw, api: serverUrl, expectedHash: expectedHash)
+        let url = try Self.validatedNetworkURL(resolved.absoluteString, name: "asset download URL", allowQuery: true)
+        guard isAssetProxy else { return (url, nil) }
+        var request = try requestForAPIURL(url)
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return (url, request)
     }
 
     private func data(
@@ -1203,7 +1213,9 @@ public final class NitroPushSdk {
         log("downloadManifestRelease", "GET \(Self.redactedURL(validatedURL))")
         let manifestRequest: URLRequest
         if let api = serverUrl, Self.sameOrigin(validatedURL, api) {
-            manifestRequest = try requestForAPIURL(validatedURL)
+            var request = try requestForAPIURL(validatedURL)
+            if deviceToken != nil && validatedURL.scheme?.lowercased() == "https" { request.setValue("proxy-v1", forHTTPHeaderField: "x-nitropush-asset-delivery") }
+            manifestRequest = request
         } else {
             manifestRequest = URLRequest(url: validatedURL)
         }
@@ -1275,9 +1287,14 @@ public final class NitroPushSdk {
             withIntermediateDirectories: true
         )
 
-        // Experimental delta path: attempt patch application, fall back to full download.
+        // A verified target is already complete: do not download even a smaller patch.
+        let cachedBundleSize = try copyCachedContentHash(
+            sha256: manifest.bundle.sha256, dest: bundleDest,
+            announcedSize: manifest.bundle.size ?? -1, maximumBytes: Self.maxBundleBytes
+        )
+        // Experimental delta path: cache miss -> patch -> full download fallback.
         var usedDelta = false
-        if enableDeltaUpdates, pkg.kind != "nativescript",
+        if cachedBundleSize == nil, enableDeltaUpdates, pkg.kind != "nativescript",
            let delta = pkg.delta ?? manifest.bundle.delta?.toPlain(),
            delta.algorithm == "bsdiff4",
            let currentBundleHash = currentBundleHashForDelta(),
@@ -1331,11 +1348,11 @@ public final class NitroPushSdk {
                 return false
             }
         }
-        if !usedDelta {
+        if cachedBundleSize == nil && !usedDelta {
             usedDelta = await tryFileDelta(manifest.bundle.originalPath, manifest.bundle.sha256, manifest.bundle.size, manifest.bundle.fileDelta, bundleDest, Self.maxBundleBytes)
         }
-        var installedBytes = 0
-        if !usedDelta {
+        var installedBytes = cachedBundleSize ?? 0
+        if cachedBundleSize == nil && !usedDelta {
             let bundleDownloadUrl: String
             if let url = manifest.bundle.downloadUrl {
                 bundleDownloadUrl = url
@@ -1349,7 +1366,7 @@ public final class NitroPushSdk {
                 announcedSize: manifest.bundle.size ?? -1,
                 maximumBytes: Self.maxBundleBytes
             )
-        } else {
+        } else if usedDelta {
             let values = try bundleDest.resourceValues(forKeys: [.fileSizeKey])
             installedBytes += values.fileSize ?? 0
         }
@@ -1366,22 +1383,22 @@ public final class NitroPushSdk {
                 at: dest.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let assetDownloadUrl: String
-            if let url = asset.downloadUrl {
-                assetDownloadUrl = url
-            } else {
-                assetDownloadUrl = try resolveObjectURL(asset.objectKey).absoluteString
-            }
-            if await tryFileDelta(asset.originalPath, asset.sha256, asset.size, asset.fileDelta, dest, Self.maxAssetBytes) {
+            if let cachedSize = try copyCachedContentHash(
+                sha256: asset.sha256, dest: dest,
+                announcedSize: asset.size ?? -1, maximumBytes: Self.maxAssetBytes
+            ) {
+                installedBytes += cachedSize
+            } else if await tryFileDelta(asset.originalPath, asset.sha256, asset.size, asset.fileDelta, dest, Self.maxAssetBytes) {
                 installedBytes += asset.size ?? 0
             } else {
-            installedBytes += try await fetchByContentHash(
-                urlString: assetDownloadUrl,
-                sha256: asset.sha256,
-                dest: dest,
-                announcedSize: asset.size ?? -1,
-                maximumBytes: Self.maxAssetBytes
-            )
+                let assetDownloadUrl = try asset.downloadUrl ?? resolveObjectURL(asset.objectKey).absoluteString
+                installedBytes += try await fetchByContentHash(
+                    urlString: assetDownloadUrl,
+                    sha256: asset.sha256,
+                    dest: dest,
+                    announcedSize: asset.size ?? -1,
+                    maximumBytes: Self.maxAssetBytes
+                )
             }
             guard installedBytes <= Self.maxReleaseBytes else {
                 throw NitroPushError.integrityFailure("release content exceeds the allowed size")
@@ -1454,6 +1471,16 @@ public final class NitroPushSdk {
         return true
     }
 
+    private func copyCachedContentHash(sha256: String, dest: URL, announcedSize: Int, maximumBytes: Int) throws -> Int? {
+        let directory = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
+        if let size = try NPContentHashCache.copyVerified(
+            directory: directory,
+            sha256: sha256, destination: dest, announcedSize: announcedSize, maximumBytes: maximumBytes
+        ) { return size }
+        guard embeddedAssets.populate(directory: directory, sha256: sha256, announcedSize: announcedSize, maximumBytes: maximumBytes) else { return nil }
+        return try NPContentHashCache.copyVerified(directory: directory, sha256: sha256, destination: dest, announcedSize: announcedSize, maximumBytes: maximumBytes)
+    }
+
     /// sha256-keyed disk cache, shared across releases. If `<cache>/<sha>` exists
     /// we copy it to `dest` and skip the network. Otherwise download to the cache
     /// path (verifying), then copy.
@@ -1464,45 +1491,20 @@ public final class NitroPushSdk {
         announcedSize: Int,
         maximumBytes: Int
     ) async throws -> Int {
+        if let size = try copyCachedContentHash(sha256: sha256, dest: dest, announcedSize: announcedSize, maximumBytes: maximumBytes) {
+            return size
+        }
         let cacheDir = Self.rootDir().appendingPathComponent("cache", isDirectory: true)
-        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        let cached = cacheDir.appendingPathComponent(sha256)
-
-        if FileManager.default.fileExists(atPath: cached.path) {
-            let cachedHash = try Self.sha256Hex(of: cached)
-            let values = try cached.resourceValues(forKeys: [.fileSizeKey])
-            if cachedHash != sha256
-                || values.fileSize == nil
-                || values.fileSize! <= 0
-                || values.fileSize! > maximumBytes
-                || (announcedSize > 0 && values.fileSize != announcedSize) {
-                try? FileManager.default.removeItem(at: cached)
-            }
-        }
-        if !FileManager.default.fileExists(atPath: cached.path) {
-            let url = try Self.validatedNetworkURL(
-                urlString,
-                name: "asset download URL",
-                allowQuery: true
-            )
-            try await downloadToFile(
-                url: url,
-                dest: cached,
-                expectedSha256: sha256,
-                announcedSize: announcedSize,
-                maximumBytes: maximumBytes
-            )
-        } else {
-            touchFile(cached)
-        }
-        if FileManager.default.fileExists(atPath: dest.path) {
-            try FileManager.default.removeItem(at: dest)
-        }
-        try FileManager.default.copyItem(at: cached, to: dest)
-        let values = try dest.resourceValues(forKeys: [.fileSizeKey])
-        guard let size = values.fileSize, size > 0, size <= maximumBytes else {
-            try? FileManager.default.removeItem(at: dest)
-            throw NitroPushError.integrityFailure("download exceeds the allowed size")
+        let cached = try NPContentHashCache.file(directory: cacheDir, sha256: sha256)
+        try FileManager.default.createDirectory(at: cached.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let (url, assetRequest) = try assetDownloadRequest(urlString, expectedHash: sha256)
+        try await downloadToFile(
+            url: url, dest: cached, expectedSha256: sha256,
+            announcedSize: announcedSize, maximumBytes: maximumBytes,
+            authenticatedRequest: assetRequest
+        )
+        guard let size = try copyCachedContentHash(sha256: sha256, dest: dest, announcedSize: announcedSize, maximumBytes: maximumBytes) else {
+            throw NitroPushError.integrityFailure("downloaded cache content failed verification")
         }
         return size
     }
@@ -1549,6 +1551,9 @@ public final class NitroPushSdk {
             throw NitroPushError.networkFailure(
                 "download returned a non-success response from \(Self.redactedURL(url))"
             )
+        }
+        if authenticatedRequest?.url?.path == "/api/sdk/asset", http.statusCode != 200 {
+            throw NitroPushError.networkFailure("asset proxy must return a complete response")
         }
         let values = try tmpURL.resourceValues(forKeys: [.fileSizeKey])
         guard let downloadedSize = values.fileSize,

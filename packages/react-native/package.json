@@ -35,6 +35,8 @@
     "nitro.json",
     "android/build.gradle",
     "android/fix-prefab.gradle",
+    "android/embedded-assets.gradle",
+    "scripts/embedded-assets.cjs",
     "android/gradle.properties",
     "android/CMakeLists.txt",
     "android/src/**/*",
@@ -45,7 +47,8 @@
     "ios/**/*.cpp",
     "ios/**/*.swift",
     "*.podspec",
-    "README.md"
+    "README.md",
+    "EMBEDDED_ASSETS.md"
   ],
   "homepage": "https://nitropush.org",
   "repository": {
