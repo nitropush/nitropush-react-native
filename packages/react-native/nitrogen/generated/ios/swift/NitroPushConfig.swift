@@ -55,7 +55,7 @@ public extension NitroPushConfig {
   var deploymentKey: String {
     return String(self.__deploymentKey)
   }
-  
+
   @inline(__always)
   var storageBaseUrl: String {
     return String(self.__storageBaseUrl)
@@ -72,7 +72,7 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var appVersion: String? {
     return { () -> String? in
@@ -84,7 +84,7 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var clientUniqueId: String? {
     return { () -> String? in
@@ -96,7 +96,7 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var enableDeltaUpdates: Bool? {
     return { () -> Bool? in

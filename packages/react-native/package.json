@@ -1,6 +1,6 @@
 {
   "name": "@nitropush/react-native",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "description": "Over-the-air updates for React Native and Expo with signed bundles, staged rollouts, rollback protection, and delta delivery.",
   "main": "src/index.ts",
   "module": "src/index.ts",
