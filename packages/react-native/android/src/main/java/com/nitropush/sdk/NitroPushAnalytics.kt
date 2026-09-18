@@ -21,6 +21,8 @@ import kotlin.math.min
  * contract — moving from JS to native must not change the server schema.
  */
 internal data class NPAnalyticsEvent(
+    /** Stable across retries so server-side insertion is idempotent. */
+    val eventId: String,
     val eventType: String,
     val clientUniqueId: String,
     val appVersion: String,
@@ -46,6 +48,7 @@ internal data class NPAnalyticsEvent(
 internal class NPAnalytics(
     serverUrl: String,
     private val deploymentKey: String,
+    private var deviceToken: String?,
     private val capacity: Int = 200,
     private val flushAt: Int = 10,
     private val flushIntervalMs: Long = 30_000L,
@@ -84,6 +87,10 @@ internal class NPAnalytics(
 
     fun flush() {
         executor.execute { flushLocked() }
+    }
+
+    fun setDeviceToken(token: String) {
+        executor.execute { deviceToken = token }
     }
 
     fun stop() {
@@ -154,13 +161,16 @@ internal class NPAnalytics(
                 connectTimeout = 15_000
                 readTimeout = 60_000
                 doOutput = true
+                instanceFollowRedirects = false
                 setRequestProperty("Content-Type", "application/json")
+                deviceToken?.takeIf { it.isNotEmpty() }?.let {
+                    setRequestProperty("x-nitropush-device-token", it)
+                }
                 setFixedLengthStreamingMode(body.size)
             }
             conn.outputStream.use { it.write(body) }
             val code = conn.responseCode
-            // Drain so the JVM can pool the connection.
-            try { conn.inputStream.use { it.readBytes() } } catch (_: Throwable) {}
+            // The status is the entire protocol. Never buffer an untrusted body.
             code in 200..299
         } catch (_: Throwable) {
             false
@@ -172,6 +182,7 @@ internal class NPAnalytics(
 
 private fun NPAnalyticsEvent.toJson(): JSONObject {
     val obj = JSONObject()
+    obj.put("eventId", eventId)
     obj.put("eventType", eventType)
     obj.put("clientUniqueId", clientUniqueId)
     obj.put("appVersion", appVersion)

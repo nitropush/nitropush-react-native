@@ -29,6 +29,9 @@ data class NitroPushConfig(
   val storageBaseUrl: String,
   @DoNotStrip
   @Keep
+  val bundlePublicKey: String?,
+  @DoNotStrip
+  @Keep
   val appVersion: String?,
   @DoNotStrip
   @Keep
@@ -45,6 +48,7 @@ data class NitroPushConfig(
     return Objects.deepEquals(this.serverUrl, other.serverUrl)
       && Objects.deepEquals(this.deploymentKey, other.deploymentKey)
       && Objects.deepEquals(this.storageBaseUrl, other.storageBaseUrl)
+      && Objects.deepEquals(this.bundlePublicKey, other.bundlePublicKey)
       && Objects.deepEquals(this.appVersion, other.appVersion)
       && Objects.deepEquals(this.clientUniqueId, other.clientUniqueId)
       && Objects.deepEquals(this.enableDeltaUpdates, other.enableDeltaUpdates)
@@ -55,6 +59,7 @@ data class NitroPushConfig(
       serverUrl,
       deploymentKey,
       storageBaseUrl,
+      bundlePublicKey,
       appVersion,
       clientUniqueId,
       enableDeltaUpdates
@@ -69,8 +74,8 @@ data class NitroPushConfig(
     @Keep
     @Suppress("unused")
     @JvmStatic
-    private fun fromCpp(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Boolean?): NitroPushConfig {
-      return NitroPushConfig(serverUrl, deploymentKey, storageBaseUrl, appVersion, clientUniqueId, enableDeltaUpdates)
+    private fun fromCpp(serverUrl: String, deploymentKey: String, storageBaseUrl: String, bundlePublicKey: String?, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Boolean?): NitroPushConfig {
+      return NitroPushConfig(serverUrl, deploymentKey, storageBaseUrl, bundlePublicKey, appVersion, clientUniqueId, enableDeltaUpdates)
     }
   }
 }

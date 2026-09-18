@@ -28,6 +28,16 @@ data class NPConfig(
     val enableDeltaUpdates: Boolean = false,
 )
 
+data class NPDeltaPatch(
+    val fromBundleHash: String,
+    val patchObjectKey: String,
+    val patchSize: Int,
+    val patchSha256: String,
+    val algorithm: String,
+    /** Optional API-issued, device-bound patch URL. */
+    val deltaDownloadUrl: String? = null,
+)
+
 data class NPRemotePackage(
     val releaseId: String,
     /** "codepush" (tarball) or "expo" (manifest). */
@@ -47,6 +57,8 @@ data class NPRemotePackage(
     /** Bucket-relative key. SDK joins with `NPConfig.storageBaseUrl`.
      *  Codepush → tarball key; expo → manifest key. */
     val downloadObjectKey: String,
+    /** Patch selected by the server for this device's current bundle hash. */
+    val delta: NPDeltaPatch? = null,
 )
 
 data class NPLocalPackage(

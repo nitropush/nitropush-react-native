@@ -3,7 +3,7 @@ PODS:
   - hermes-engine (250829098.0.10):
     - hermes-engine/Pre-built (= 250829098.0.10)
   - hermes-engine/Pre-built (250829098.0.10)
-  - NitroModules (0.35.6):
+  - NitroModules (0.37.1):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -26,7 +26,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - NitroPush (0.1.0):
+  - NitroPush (1.0.0-beta.3):
     - hermes-engine
     - NitroModules
     - RCTRequired
@@ -1449,7 +1449,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - react-native-safe-area-context (5.7.0):
+  - react-native-safe-area-context (5.8.0):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -1461,8 +1461,8 @@ PODS:
     - React-graphics
     - React-ImageManager
     - React-jsi
-    - react-native-safe-area-context/common (= 5.7.0)
-    - react-native-safe-area-context/fabric (= 5.7.0)
+    - react-native-safe-area-context/common (= 5.8.0)
+    - react-native-safe-area-context/fabric (= 5.8.0)
     - React-NativeModulesApple
     - React-RCTFabric
     - React-renderercss
@@ -1473,7 +1473,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - react-native-safe-area-context/common (5.7.0):
+  - react-native-safe-area-context/common (5.8.0):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -1495,7 +1495,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - react-native-safe-area-context/fabric (5.7.0):
+  - react-native-safe-area-context/fabric (5.8.0):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -2145,8 +2145,8 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   FBLazyVector: 24e62c765683b8d89006a88a2c8f5cf019f0074d
   hermes-engine: 496ee73900cd70db99e642d25acb9dec0d8eab31
-  NitroModules: dc907392cf13e7510eca133296acbc59528d9002
-  NitroPush: 4b8adeeb1325d049e2d4f17695eb517b4a1a8764
+  NitroModules: 38f8754287858ff1294e43fd43f614a664e54050
+  NitroPush: e927b9a2d7c1a7ac2007d29761bec0cff11e796d
   RCTDeprecation: a4c521821fab57cbb125b36effe84d897d0dfa12
   RCTRequired: 9f3a7e5645d4bc3f551593de7550bb66ab6e42bc
   RCTSwiftUI: 239ed2eb9e73de5a6f518810630f0c95e01c8702
@@ -2184,7 +2184,7 @@ SPEC CHECKSUMS:
   React-Mapbuffer: fec3e025f0ffba6b32cd2a1d7bbdee3e269aae90
   React-microtasksnativemodule: ab33a818d339f5a1da308893c11b487be66121a8
   React-mutationobservernativemodule: a42d1626651ccd7d0dc02a56e69d4ec77c248893
-  react-native-safe-area-context: 6b4966397ada0f7dd481e4486a2ef936834861a1
+  react-native-safe-area-context: fb5c8ee9f6dd62ef710611b3d370c501f42a4ac0
   React-NativeModulesApple: deba264b03bd79c6bd61014fa30e40321b5e443a
   React-networking: 35e6070b084f435429f85c5db40b4d5b38652fe9
   React-oscompat: 64a0c7ef5441855dc6e2a6afe8ba8f92aa05075e
@@ -2221,6 +2221,6 @@ SPEC CHECKSUMS:
   ReactNativeDependencies: 6d910cfbc02504a3e009beb8f54ca094d2885a9d
   Yoga: 77dfa8673de2874e1855002ae59c68b8be9b007b
 
-PODFILE CHECKSUM: e2647c05178aa97981047ec7976bdf123d9b1eb6
+PODFILE CHECKSUM: 53dedccde7ada9a02bde1513345232db1cacae28
 
 COCOAPODS: 1.16.2

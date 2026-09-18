@@ -22,6 +22,7 @@ apply plugin: "com.android.library"
 apply plugin: 'org.jetbrains.kotlin.android'
 apply from: '../nitrogen/generated/android/NitroPush+autolinking.gradle'
 apply from: "./fix-prefab.gradle"
+apply from: "./embedded-assets.gradle"
 
 if (isNewArchitectureEnabled()) {
   apply plugin: "com.facebook.react"

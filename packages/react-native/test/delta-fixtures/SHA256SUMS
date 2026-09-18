@@ -1,0 +1,4 @@
+37bf4d6a1e4146e0d61b0b5a41e9a1aca624cf36e1dd09cceaa2b9bc6c3ab5e7  old.bundle
+8638bdd5fe8ebc286ebc1fb9a542a240abb93f3275a18e3c63cf164cadd678d0  new.bundle
+31a2b6770a5bc141e32cfb26dea1fb5cfbd11dbbd39660507646ee635bf6d7a3  wrong-base.bundle
+e6ad467380dbbd182fce380f875e6275441952d81ac97de47bb2bf5be4b8d9f1  old-to-new.bsdiff

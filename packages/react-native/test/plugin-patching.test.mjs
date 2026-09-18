@@ -1,0 +1,152 @@
+import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
+import test from "node:test";
+import { spawnSync } from "node:child_process";
+
+import {
+  patchAppDelegateSwift,
+  patchExpoPodfile,
+  patchMainApplicationKotlin,
+  resolveDeploymentKey,
+  validateBundlePublicKey,
+  patchEmbeddedAssetBuildPhase,
+} from "../plugin/build/index.js";
+
+test("iOS embedded inventory hook follows bundling, is idempotent, and preserves bundle failure", () => {
+  const source = 'echo "react-native-xcode.sh"\nfalse';
+  const patched = patchEmbeddedAssetBuildPhase(source);
+  assert.equal(patchEmbeddedAssetBuildPhase(patched), patched);
+  assert(patched.indexOf('react-native-xcode.sh') < patched.indexOf('embedded-assets.cjs'));
+  assert.match(patched, /CONFIGURATION_BUILD_DIR\/\$UNLOCALIZED_RESOURCES_FOLDER_PATH/);
+  assert.equal(spawnSync('/bin/sh', ['-n', '-c', patched]).status, 0);
+  assert.equal(spawnSync('/bin/sh', ['-c', patched]).status, 1);
+});
+
+const expo57MainApplication = `package org.nitropush.validation
+
+import android.app.Application
+import expo.modules.ExpoReactHostFactory
+
+class MainApplication : Application(), ReactApplication {
+  override val reactHost: ReactHost by lazy {
+    ExpoReactHostFactory.getDefaultReactHost(
+      context = applicationContext,
+      packageList = PackageList(this).packages
+    )
+  }
+
+  override fun onCreate() {
+    super.onCreate()
+    loadReactNative(this)
+  }
+}
+`;
+
+test("Expo 57 ReactHost receives the active production bundle path", () => {
+  const patched = patchMainApplicationKotlin(expo57MainApplication);
+
+  assert.match(patched, /import com\.nitropush\.sdk\.NitroPushSdk/);
+  assert.match(patched, /NitroPushSdk\.install\(this\)/);
+  assert.match(
+    patched,
+    /jsBundleFilePath\s*=\s*if \(BuildConfig\.DEBUG\) null else NitroPushSdk\.shared\.activeBundleFile\(\),/,
+  );
+});
+
+test("Expo 57 patch is idempotent", () => {
+  const once = patchMainApplicationKotlin(expo57MainApplication);
+  const twice = patchMainApplicationKotlin(once);
+
+  assert.equal(twice, once);
+});
+
+const expo57Podfile = `post_install do |installer|
+  react_native_post_install(
+    installer,
+    config[:reactNativePath],
+    :mac_catalyst_enabled => false,
+    :ccache_enabled => ccache_enabled?(podfile_properties),
+  )
+end
+`;
+
+test("iOS plugin enables C++ interop without rewriting umbrella headers", () => {
+  const patched = patchExpoPodfile(expo57Podfile);
+
+  assert.match(patched, /SWIFT_OBJC_INTEROP_MODE/);
+  assert.match(patched, /Headers\/Private\/NitroModules/);
+  assert.doesNotMatch(patched, /umbrella/i);
+  assert.doesNotMatch(patched, /\.hpp/);
+  assert.equal(patchExpoPodfile(patched), patched);
+});
+
+const expoAppDelegate = `import Expo
+
+class AppDelegate: ExpoAppDelegate {
+  override func bundleURL() -> URL? {
+    return nil
+  }
+}
+`;
+
+test("iOS configure block is removed when disabled or deployment key is removed", () => {
+  const source = expoAppDelegate.replace('  override func bundleURL()', '  func start() {\n    let delegate = ReactNativeDelegate()\n  }\n  override func bundleURL()');
+  const enabled = patchAppDelegateSwift(source, { nativeConfigure: true, deploymentKey: 'test-key' });
+  assert.match(enabled, /nitropush-ios-configure/);
+  for (const options of [{ nativeConfigure: false, deploymentKey: 'test-key' }, { nativeConfigure: true }]) {
+    const disabled = patchAppDelegateSwift(enabled, options);
+    assert.doesNotMatch(disabled, /nitropush-ios-configure|deploymentKey:\s+"test-key"/);
+    assert.equal(patchAppDelegateSwift(disabled, options), disabled);
+  }
+});
+
+test("iOS plugin never confirms an update from a native lifecycle callback", () => {
+  const patched = patchAppDelegateSwift(expoAppDelegate);
+
+  assert.doesNotMatch(patched, /notifyAppReady/);
+  assert.doesNotMatch(patched, /applicationDidBecomeActive/);
+});
+
+test("plugin validates a canonical P-256 SPKI and rejects malformed/wrong-curve keys", () => {
+  const p256 = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+    .publicKey.export({ format: "der", type: "spki" })
+    .toString("base64");
+  const p384 = generateKeyPairSync("ec", { namedCurve: "secp384r1" })
+    .publicKey.export({ format: "der", type: "spki" })
+    .toString("base64");
+
+  assert.doesNotThrow(() => validateBundlePublicKey(p256));
+  assert.throws(() => validateBundlePublicKey("not base64"), /base64 DER/);
+  assert.throws(() => validateBundlePublicKey(p384), /P-256/);
+});
+
+test("plugin resolves deployment credentials from a private build variable", () => {
+  assert.deepEqual(
+    resolveDeploymentKey(undefined, { NITROPUSH_DEPLOYMENT_KEY: "  test-key  " }),
+    {
+      deploymentKey: "test-key",
+      deploymentKeyEnvVar: "NITROPUSH_DEPLOYMENT_KEY",
+    },
+  );
+  assert.deepEqual(
+    resolveDeploymentKey(
+      { deploymentKeyEnvVar: "CUSTOM_NITROPUSH_KEY" },
+      { CUSTOM_NITROPUSH_KEY: "custom-key" },
+    ),
+    {
+      deploymentKey: "custom-key",
+      deploymentKeyEnvVar: "CUSTOM_NITROPUSH_KEY",
+    },
+  );
+  assert.equal(
+    resolveDeploymentKey(
+      { deploymentKey: "inline-key", deploymentKeyEnvVar: "CUSTOM_KEY" },
+      { CUSTOM_KEY: "environment-key" },
+    ).deploymentKey,
+    "inline-key",
+  );
+  assert.throws(
+    () => resolveDeploymentKey({ deploymentKeyEnvVar: "BAD-NAME" }, {}),
+    /environment variable name/,
+  );
+});

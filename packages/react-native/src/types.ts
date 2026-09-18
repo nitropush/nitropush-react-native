@@ -130,6 +130,11 @@ export interface NitroPushConfig {
    * `http://10.0.2.2:9000/nitropush-bundles`.
    */
   storageBaseUrl: string;
+  /**
+   * Base64-encoded DER SPKI public key used to verify signed bundles.
+   * Required only when releases are uploaded with `--signing-key`.
+   */
+  bundlePublicKey?: string;
   /** Native app version, e.g. `1.4.0`. Falls back to the binary's `CFBundleShortVersionString` / Android `versionName`. */
   appVersion?: string;
   /** Optional unique device id used for deterministic rollout bucketing. */

@@ -18,8 +18,14 @@ public extension NitroPushConfig {
   /**
    * Create a new instance of `NitroPushConfig`.
    */
-  init(serverUrl: String, deploymentKey: String, storageBaseUrl: String, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Bool?) {
+  init(serverUrl: String, deploymentKey: String, storageBaseUrl: String, bundlePublicKey: String?, appVersion: String?, clientUniqueId: String?, enableDeltaUpdates: Bool?) {
     self.init(std.string(serverUrl), std.string(deploymentKey), std.string(storageBaseUrl), { () -> bridge.std__optional_std__string_ in
+      if let __unwrappedValue = bundlePublicKey {
+        return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
+      } else {
+        return .init()
+      }
+    }(), { () -> bridge.std__optional_std__string_ in
       if let __unwrappedValue = appVersion {
         return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
       } else {
@@ -44,17 +50,29 @@ public extension NitroPushConfig {
   var serverUrl: String {
     return String(self.__serverUrl)
   }
-  
+
   @inline(__always)
   var deploymentKey: String {
     return String(self.__deploymentKey)
   }
-  
+
   @inline(__always)
   var storageBaseUrl: String {
     return String(self.__storageBaseUrl)
   }
-  
+
+  @inline(__always)
+  var bundlePublicKey: String? {
+    return { () -> String? in
+      if bridge.has_value_std__optional_std__string_(self.__bundlePublicKey) {
+        let __unwrapped = bridge.get_std__optional_std__string_(self.__bundlePublicKey)
+        return String(__unwrapped)
+      } else {
+        return nil
+      }
+    }()
+  }
+
   @inline(__always)
   var appVersion: String? {
     return { () -> String? in
@@ -66,7 +84,7 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var clientUniqueId: String? {
     return { () -> String? in
@@ -78,7 +96,7 @@ public extension NitroPushConfig {
       }
     }()
   }
-  
+
   @inline(__always)
   var enableDeltaUpdates: Bool? {
     return { () -> Bool? in

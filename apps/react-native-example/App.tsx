@@ -1,34 +1,15 @@
 /**
- * NitroPush demo for the bare React Native example — **native-driven**.
+ * NitroPush demo for the bare React Native example.
  *
- * Everything that touches the SDK is native:
- *
- *   ios/NitropushRNExample/AppDelegate.swift
- *     • configure() before React Native loads
- *     • detached check → download → install task on every cold start
- *     • notifyAppReady() in applicationDidBecomeActive
- *     • bundleURL() short-circuit to the active OTA bundle
- *
- *   android/.../MainApplication.kt
- *     • configure() before React Native loads
- *     • background-thread check → download → install on every cold start
- *     • activeBundleFile() handed to the React host
- *
- *   android/.../MainActivity.kt
- *     • notifyAppReady() in onResume
- *
- * This file (App.tsx) is purely a status display — it never calls any
- * mutating SDK method. It builds a JS-side client via `configure()`
- * (reading Info.plist / manifest meta-data the native side already
- * applied) and inspects state via `getUpdateMetadataSync` +
- * `getPendingUpdate`. User-controlled actions ("apply pending",
- * "rollback") are surfaced so the user can apply or discard a staged
- * bundle without waiting for the next cold start.
+ * Native code selects the active OTA bundle. JavaScript configures the SDK
+ * at module scope and, critically, calls notifyAppReady only after React's
+ * first successful render. A native foreground callback must never confirm
+ * an update because it cannot prove the JavaScript bundle rendered.
  *
  * @format
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Pressable,
   StatusBar,
@@ -40,10 +21,16 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
-  configureWith,
+  configure,
+  sync,
+  InstallMode,
   type LocalPackage,
   type NitroPushClient,
 } from '@nitropush/react-native';
+
+// Reads NITROPUSH_* from Info.plist / AndroidManifest. Module scope ensures
+// configuration completes before any component calls another SDK API.
+const client: NitroPushClient = configure();
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -58,15 +45,6 @@ function App() {
 
 function Demo() {
   const insets = useSafeAreaInsets();
-  // Reads NITROPUSH_* keys from Info.plist (iOS) / AndroidManifest
-  // meta-data (Android). The native side already applied the same
-  // config at launch — this client just gives JS a handle.
-  const client: NitroPushClient = useMemo(() => configureWith({
-    serverUrl: 'http://192.168.0.141:3003',
-    storageBaseUrl: 'http://192.168.0.141:9001/nitrolift-bundles',
-    deploymentKey: 'nl_test_gLaFtFCoG6M6v3WrTCT8yConLA0onKfb1HxU7k8EoxI'
-  }), []);
-
   // First-paint reads via the sync helper — avoids a microtask hop and
   // gives us metadata before the first frame paints. Falls back to the
   // async helper afterwards in case the singleton wasn't ready yet on
@@ -76,24 +54,36 @@ function Demo() {
   );
   const [pending, setPending] = useState<LocalPackage | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    // This is the rollback health boundary: it runs only after React has
+    // mounted this screen successfully.
+    client.notifyAppReady().catch((e) => setError(String(e)));
+  }, []);
 
   const refresh = useCallback(async () => {
+    setBusy(true);
+    setError(null);
     try {
-      const [r, p, u] = await Promise.all([
+      await sync(client, { installMode: InstallMode.ON_NEXT_RESTART }, (_status, failure) => {
+        if (failure) setError(failure.message);
+      });
+      const [r, p] = await Promise.all([
         client.getCurrentPackage(),
         client.getPendingPackage(),
-        client.checkForUpdate(),
       ]);
 
       setPending(p);
-      console.log('remote', u && u.label);
+      setRunning(r);
       console.log('running', r && r.label, 'pending', p && p.label);
-      setError(null);
     } catch (e) {
       console.log(e);
       setError(String(e));
+    } finally {
+      setBusy(false);
     }
-  }, [client]);
+  }, []);
 
   const rollbackPending = useCallback(async () => {
     if (!pending) return;
@@ -109,7 +99,7 @@ function Demo() {
   return (
     <View style={[styles.root, { paddingTop: insets.top + 24 }]}>
       <Text style={styles.title}>NitroPush demo</Text>
-      <Text style={styles.subtitle}>native-driven</Text>
+      <Text style={styles.subtitle}>native-driven · Embedded v1</Text>
 
       <View style={styles.card}>
         <Text style={styles.label}>Running</Text>
@@ -130,8 +120,8 @@ function Demo() {
         ) : null}
       </View>
 
-      <Pressable style={styles.button} onPress={refresh}>
-        <Text style={styles.buttonLabel}>Refresh</Text>
+      <Pressable style={styles.button} disabled={busy} onPress={refresh}>
+        <Text style={styles.buttonLabel}>{busy ? 'Working…' : 'Refresh'}</Text>
       </Pressable>
 
       <Pressable
@@ -149,7 +139,7 @@ function Demo() {
       </Pressable>
 
       <Text style={styles.hint}>
-        configure / sync / notifyAppReady all run from native. JS just observes.
+        notifyAppReady runs only after this React screen mounts successfully.
       </Text>
     </View>
   );

@@ -8,18 +8,15 @@
  *
  * ```ts
  * import {
+ *   configure,
  *   configureWith,
  *   sync,
  *   InstallMode,
  *   SyncStatus,
  * } from '@nitropush/react-native';
  *
- * // 1. Build a client once at module scope
- * const client = configureWith({
- *   serverUrl: 'https://nitropush.example.com',
- *   deploymentKey: 'PROD-…',
- *   storageBaseUrl: 'https://nitropush-bundles.s3.amazonaws.com',
- * });
+ * // 1. Build a client once at module scope. Reads native plugin config.
+ * const client = configure();
  *
  * // 2. Use it
  * useEffect(() => {

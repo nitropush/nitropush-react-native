@@ -1,0 +1,22 @@
+// The RN/Expo bundling task owns both directories. Extend that task's outputs
+// before mergeAssets consumes them; this also covers bare RN autolinking.
+def nitropushInventoryScript = file('../scripts/embedded-assets.cjs').absolutePath
+rootProject.allprojects { applicationProject ->
+    applicationProject.pluginManager.withPlugin('com.android.application') {
+        applicationProject.tasks.configureEach { bundleTask ->
+            if (bundleTask.name.startsWith('createBundle') && bundleTask.name.endsWith('JsAndAssets') &&
+                    bundleTask.hasProperty('jsBundleDir') && bundleTask.hasProperty('resourcesDir')) {
+                bundleTask.inputs.file(nitropushInventoryScript)
+                bundleTask.doLast {
+                    def command = new ArrayList(bundleTask.nodeExecutableAndArgs.get())
+                    command.addAll([nitropushInventoryScript, '--platform', 'android',
+                        '--assets-root', bundleTask.jsBundleDir.get().asFile.absolutePath,
+                        '--resources-root', bundleTask.resourcesDir.get().asFile.absolutePath,
+                        '--bundle-name', bundleTask.bundleAssetName.get()])
+                    def process = new ProcessBuilder(command).directory(applicationProject.projectDir).inheritIO().start()
+                    if (process.waitFor() != 0) throw new GradleException('NitroPush embedded asset inventory failed')
+                }
+            }
+        }
+    }
+}

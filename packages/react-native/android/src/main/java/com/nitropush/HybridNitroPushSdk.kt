@@ -47,6 +47,7 @@ private fun NitroPushConfig.toPlain() = NPConfig(
   serverUrl = serverUrl,
   deploymentKey = deploymentKey,
   storageBaseUrl = storageBaseUrl,
+  bundlePublicKey = bundlePublicKey,
   appVersion = appVersion,
   clientUniqueId = clientUniqueId,
   enableDeltaUpdates = enableDeltaUpdates ?: false,

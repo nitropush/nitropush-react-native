@@ -26,6 +26,7 @@
 
 #ifndef BSPATCH_H
 #define BSPATCH_H
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,7 +40,7 @@ extern "C" {
  * @param patchfile Path to the bsdiff4 patch file.
  * @return 0 on success, non-zero on failure.
  */
-int bspatch_apply(const char *oldfile, const char *patchfile, const char *newfile);
+int bspatch_apply(const char *oldfile, const char *patchfile, const char *newfile, uint64_t expected_size);
 
 #ifdef __cplusplus
 }

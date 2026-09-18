@@ -5,5 +5,6 @@
 func _bspatch_apply(
     _ oldfile: UnsafePointer<CChar>,
     _ patchfile: UnsafePointer<CChar>,
-    _ newfile: UnsafePointer<CChar>
+    _ newfile: UnsafePointer<CChar>,
+    _ expectedSize: UInt64
 ) -> Int32

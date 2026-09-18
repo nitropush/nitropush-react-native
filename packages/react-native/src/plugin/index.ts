@@ -15,8 +15,9 @@
  *                             check inside `bundleURL()` — guarded by
  *                             `#if !DEBUG` so dev builds keep loading from
  *                             Metro
- *                             inject `applicationDidBecomeActive` override
- *                             that calls `NitroPushSdk.shared.notifyAppReady()`
+ *                             JS must call `notifyAppReady()` only after a
+ *                             successful first render; native lifecycle
+ *                             callbacks are intentionally never injected
  *
  *   ▸ MainApplication.kt      inject `import com.nitropush.nitrosdk.NitroPushSdk`
  *                             call `NitroPushSdk.install(this)` after
@@ -27,10 +28,10 @@
  *                             `BuildConfig.DEBUG` so dev builds keep
  *                             loading from Metro)
  *
- *   ▸ NitroModules.podspec    patch the 33 missing `public_header_files`
- *                             entries that upstream omits — required for
- *                             Xcode 26+ (see scripts/patch-nitro-modules.js
- *                             for full context)
+ *   ▸ Podfile                 opt the app target into Swift/C++ interop.
+ *                             NitroPush relies on Nitrogen's generated
+ *                             public/private header split and never rewrites
+ *                             CocoaPods umbrella headers.
  *
  * Every AppDelegate / MainApplication injection is wrapped in tagged
  * `// @generated begin … / // @generated end` markers via `mergeContents`,
@@ -46,16 +47,18 @@
  *       "plugins": [
  *         ["@nitropush/react-native", {
  *           "serverUrl": "https://nitropush.example.com",
- *           "deploymentKey": "nl_live_...",
+ *           "deploymentKeyEnvVar": "NITROPUSH_DEPLOYMENT_KEY",
  *           "storageBaseUrl": "https://cdn.example.com/bundles",
+ *           "bundlePublicKey": "BASE64_DER_PUBLIC_KEY",
+ *           "requireBundleSigning": true,
  *         }]
  *       ]
  *     }
  *   }
  *
- * `serverUrl` / `deploymentKey` / `storageBaseUrl` are optional: if omitted
- * the native configure+update-check block is skipped and you call
- * `configure()` from JS instead.
+ * `deploymentKeyEnvVar` defaults to `NITROPUSH_DEPLOYMENT_KEY`. Resolving the
+ * value inside the plugin keeps it out of Expo's public config and JS bundle.
+ * `serverUrl` / `storageBaseUrl` are optional for hosted apps.
  *
  * Network security (ATS / NSExceptionDomains on iOS, network_security_config
  * on Android) is the host app's responsibility and is intentionally NOT
@@ -72,13 +75,37 @@ import {
     withDangerousMod,
     withInfoPlist,
     withMainApplication,
+    withXcodeProject,
   } from "@expo/config-plugins";
-  import { mergeContents } from "@expo/config-plugins/build/utils/generateCode";
+  import { mergeContents, removeContents } from "@expo/config-plugins/build/utils/generateCode";
+  import { createPublicKey } from "crypto";
   import * as fs from "fs";
   import * as path from "path";
   
   const PKG_NAME = "@nitropush/react-native";
   const PKG_VERSION = "0.1.0";
+
+  /** Validate the exact public-key representation consumed by CryptoKit/JCA. */
+  export function validateBundlePublicKey(value: string): void {
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 !== 0) {
+      throw new Error(
+        "[@nitropush/react-native] bundlePublicKey must be canonical base64 DER.",
+      );
+    }
+    try {
+      const der = Buffer.from(value, "base64");
+      if (der.length === 0 || der.toString("base64") !== value) throw new Error("non-canonical");
+      const key = createPublicKey({ key: der, format: "der", type: "spki" });
+      const details = key.asymmetricKeyDetails as { namedCurve?: string } | undefined;
+      if (key.asymmetricKeyType !== "ec" || details?.namedCurve !== "prime256v1") {
+        throw new Error("wrong curve");
+      }
+    } catch {
+      throw new Error(
+        "[@nitropush/react-native] bundlePublicKey must be a base64 DER SubjectPublicKeyInfo P-256 public key.",
+      );
+    }
+  }
   
   /**
    * Optional knobs. The defaults match what 99 % of apps want; you should only
@@ -98,7 +125,17 @@ import {
      */
     serverUrl?: string;
     /** Deployment key for the target environment. Required when `serverUrl` is set. */
+    /**
+     * Deployment credential written into native configuration. Prefer
+     * `deploymentKeyEnvVar`; an inline value is retained for compatibility but
+     * becomes part of Expo's public config.
+     */
     deploymentKey?: string;
+    /**
+     * Name of the private build environment variable containing the
+     * deployment credential. Defaults to `NITROPUSH_DEPLOYMENT_KEY`.
+     */
+    deploymentKeyEnvVar?: string;
     /**
      * Object-storage base URL for bundle downloads (e.g. your MinIO / S3
      * bucket URL). Injected into Info.plist / AndroidManifest.
@@ -110,6 +147,18 @@ import {
      * Only required when your releases are signed (`--signing-key` on upload).
      */
     bundlePublicKey?: string;
+    /**
+     * Fail prebuild when `bundlePublicKey` is omitted. Use this for projects
+     * whose dashboard signing key is enabled so a build can never silently
+     * ship without on-device verification. Default: `false` for unsigned
+     * projects and backward compatibility.
+     */
+    requireBundleSigning?: boolean;
+    /**
+     * Enable experimental bsdiff4 Delta Updates. The SDK still downloads the
+     * full bundle whenever no compatible, verified patch is available.
+     */
+    enableDeltaUpdates?: boolean;
     /**
      * Inject a native `configure()` + background update-check `Task.detached`
      * into `AppDelegate.swift`. Only needed for **bare React Native** apps that
@@ -124,36 +173,82 @@ import {
     nativeConfigure?: boolean;
   }
   
+  export function resolveDeploymentKey(
+    props: Pick<NitroPushPluginProps, "deploymentKey" | "deploymentKeyEnvVar"> | void,
+    environment: NodeJS.ProcessEnv = process.env,
+  ): { deploymentKey: string; deploymentKeyEnvVar: string } {
+    const deploymentKeyEnvVar =
+      props?.deploymentKeyEnvVar?.trim() || "NITROPUSH_DEPLOYMENT_KEY";
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(deploymentKeyEnvVar)) {
+      throw new Error(
+        "[@nitropush/react-native] deploymentKeyEnvVar must be an environment variable name.",
+      );
+    }
+
+    return {
+      deploymentKey:
+        props?.deploymentKey?.trim() ||
+        environment[deploymentKeyEnvVar]?.trim() ||
+        "",
+      deploymentKeyEnvVar,
+    };
+  }
+
   const withNitroPush: ConfigPlugin<NitroPushPluginProps | void> = (
     config,
     props,
   ) => {
+    const resolvedDeployment = resolveDeploymentKey(props);
     const opts: Required<NitroPushPluginProps> = {
       ios: props?.ios ?? true,
       android: props?.android ?? true,
       serverUrl: props?.serverUrl ?? "",
-      deploymentKey: props?.deploymentKey ?? "",
+      deploymentKey: resolvedDeployment.deploymentKey,
+      deploymentKeyEnvVar: resolvedDeployment.deploymentKeyEnvVar,
       storageBaseUrl: props?.storageBaseUrl ?? "",
       bundlePublicKey: props?.bundlePublicKey ?? "",
+      requireBundleSigning: props?.requireBundleSigning ?? false,
+      enableDeltaUpdates: props?.enableDeltaUpdates ?? false,
       nativeConfigure: props?.nativeConfigure ?? false,
     };
+
+    if (opts.requireBundleSigning && !opts.bundlePublicKey) {
+      throw new Error(
+        "[@nitropush/react-native] requireBundleSigning=true requires the full base64 DER P-256 bundlePublicKey.",
+      );
+    }
+    if (opts.bundlePublicKey) validateBundlePublicKey(opts.bundlePublicKey);
+    if (opts.bundlePublicKey && !opts.deploymentKey) {
+      throw new Error(
+        "[@nitropush/react-native] bundlePublicKey requires deploymentKey so it can be injected into the native app.",
+      );
+    }
 
     // ── iOS Info.plist keys ────────────────────────────────────────────────
     // The no-arg `configure()` call reads NITROPUSH_* from Info.plist; inject
     // them whenever the plugin has values for them.
-    if (opts.ios && opts.deploymentKey) {
+    if (opts.ios) {
       config = withInfoPlist(config, (cfg) => {
-        cfg.modResults["NITROPUSH_DEPLOYMENT_KEY"] = opts.deploymentKey;
-        if (opts.serverUrl)       cfg.modResults["NITROPUSH_SERVER_URL"]       = opts.serverUrl;
-        if (opts.storageBaseUrl)  cfg.modResults["NITROPUSH_STORAGE_BASE_URL"] = opts.storageBaseUrl;
-        if (opts.bundlePublicKey) cfg.modResults["NITROPUSH_BUNDLE_PUBLIC_KEY"]= opts.bundlePublicKey;
+        const managedKeys = [
+          "NITROPUSH_DEPLOYMENT_KEY",
+          "NITROPUSH_SERVER_URL",
+          "NITROPUSH_STORAGE_BASE_URL",
+          "NITROPUSH_BUNDLE_PUBLIC_KEY",
+          "NITROPUSH_ENABLE_DELTA_UPDATES",
+        ];
+        for (const key of managedKeys) delete cfg.modResults[key];
+        if (opts.deploymentKey) cfg.modResults["NITROPUSH_DEPLOYMENT_KEY"] = opts.deploymentKey;
+        if (opts.deploymentKey && opts.serverUrl) cfg.modResults["NITROPUSH_SERVER_URL"] = opts.serverUrl;
+        if (opts.deploymentKey && opts.storageBaseUrl) cfg.modResults["NITROPUSH_STORAGE_BASE_URL"] = opts.storageBaseUrl;
+        if (opts.deploymentKey && opts.bundlePublicKey) cfg.modResults["NITROPUSH_BUNDLE_PUBLIC_KEY"] = opts.bundlePublicKey;
+        if (opts.enableDeltaUpdates) cfg.modResults["NITROPUSH_ENABLE_DELTA_UPDATES"] = true;
         return cfg;
       });
     }
 
     // ── Android <meta-data> ───────────────────────────────────────────────
     // Mirror of the iOS keys; the SDK reads them from AndroidManifest <application>.
-    if (opts.android && opts.deploymentKey) {
+    if (opts.android) {
       config = withAndroidManifest(config, (cfg) => {
         const mainApp = AndroidConfig.Manifest.getMainApplication(cfg.modResults);
         if (!mainApp) return cfg;
@@ -162,17 +257,18 @@ import {
           "NITROPUSH_SERVER_URL",
           "NITROPUSH_STORAGE_BASE_URL",
           "NITROPUSH_BUNDLE_PUBLIC_KEY",
+          "NITROPUSH_ENABLE_DELTA_UPDATES",
         ];
         // Remove stale entries first (idempotent re-runs).
         mainApp["meta-data"] = (mainApp["meta-data"] ?? []).filter(
           (m) => !MANAGED_KEYS.includes(m.$["android:name"]),
         );
-        const entries: [string, string][] = [
-          ["NITROPUSH_DEPLOYMENT_KEY", opts.deploymentKey],
-        ];
-        if (opts.serverUrl)       entries.push(["NITROPUSH_SERVER_URL",        opts.serverUrl]);
-        if (opts.storageBaseUrl)  entries.push(["NITROPUSH_STORAGE_BASE_URL",  opts.storageBaseUrl]);
-        if (opts.bundlePublicKey) entries.push(["NITROPUSH_BUNDLE_PUBLIC_KEY", opts.bundlePublicKey]);
+        const entries: [string, string][] = [];
+        if (opts.deploymentKey) entries.push(["NITROPUSH_DEPLOYMENT_KEY", opts.deploymentKey]);
+        if (opts.deploymentKey && opts.serverUrl) entries.push(["NITROPUSH_SERVER_URL", opts.serverUrl]);
+        if (opts.deploymentKey && opts.storageBaseUrl) entries.push(["NITROPUSH_STORAGE_BASE_URL", opts.storageBaseUrl]);
+        if (opts.deploymentKey && opts.bundlePublicKey) entries.push(["NITROPUSH_BUNDLE_PUBLIC_KEY", opts.bundlePublicKey]);
+        if (opts.enableDeltaUpdates) entries.push(["NITROPUSH_ENABLE_DELTA_UPDATES", "true"]);
         for (const [name, value] of entries) {
           mainApp["meta-data"].push({ $: { "android:name": name, "android:value": value } });
         }
@@ -181,6 +277,21 @@ import {
     }
 
     if (opts.ios) {
+      config = withXcodeProject(config, (cfg) => {
+        const phases = cfg.modResults.hash.project.objects.PBXShellScriptBuildPhase ?? {};
+        let patched = false;
+        for (const phase of Object.values(phases) as Array<{ shellScript?: string }>) {
+          if (typeof phase?.shellScript !== "string") continue;
+          const script = JSON.parse(phase.shellScript) as string;
+          if (!script.includes("react-native-xcode.sh")) continue;
+          phase.shellScript = JSON.stringify(patchEmbeddedAssetBuildPhase(script));
+          patched = true;
+        }
+        if (!patched) {
+          throw new Error("[@nitropush/react-native] Cannot find the iOS React Native bundle phase for embedded asset indexing.");
+        }
+        return cfg;
+      });
       config = withAppDelegate(config, (cfg) => {
         if (cfg.modResults.language !== "swift") {
           // Older Obj-C templates aren't supported by the auto-patcher.
@@ -200,10 +311,9 @@ import {
         return cfg;
       });
 
-      // Podfile post_install umbrella patch (Xcode 26): wraps the
-      // nitrogen-generated C++ `.hpp` imports in `#ifdef __cplusplus`.
-      // Idempotent via the `// @generated` tags mergeContents writes
-      // inside patchExpoPodfile, so re-running prebuild is a no-op.
+      // The NitroPush Swift module uses C++ interop, so the consuming app
+      // target must opt in as well. Nitrogen owns the pod header layout;
+      // this plugin deliberately does not rewrite umbrella headers.
       config = withDangerousMod(config, [
         "ios",
         (cfg) => {
@@ -237,32 +347,37 @@ import {
   
     return config;
   }; 
-  
-  // ─── iOS: Podfile post_install umbrella patch ────────────────────────────────
 
-  const TAG_IOS_PODFILE_UMBRELLA = "nitropush-ios-podfile-umbrella-patch";
+  /** Runs after Metro/Hermes have written final resources into the .app bundle. */
+  export function patchEmbeddedAssetBuildPhase(source: string): string {
+    const tag = "nitropush-embedded-assets-v1";
+    if (source.includes(`# ${tag}`)) return source;
+    return source.trimEnd() + "\n\n" + [
+      `# ${tag}`,
+      'NITROPUSH_BUNDLE_STATUS=$?',
+      'if [ "$NITROPUSH_BUNDLE_STATUS" -ne 0 ]; then exit "$NITROPUSH_BUNDLE_STATUS"; fi',
+      'if [ "${SKIP_BUNDLING:-0}" != "1" ]; then',
+      '  if [ -z "${NODE_BINARY:-}" ]; then',
+      '    if [ -f "$PODS_ROOT/../.xcode.env" ]; then . "$PODS_ROOT/../.xcode.env"; fi',
+      '    if [ -f "$PODS_ROOT/../.xcode.env.local" ]; then . "$PODS_ROOT/../.xcode.env.local"; fi',
+      '  fi',
+      '  NITROPUSH_NODE_BINARY="${NODE_BINARY:-node}"',
+      '  NITROPUSH_INDEX_SCRIPT="$("$NITROPUSH_NODE_BINARY" --print "require.resolve(\'@nitropush/react-native/scripts/embedded-assets.cjs\')")"',
+      '  "$NITROPUSH_NODE_BINARY" "$NITROPUSH_INDEX_SCRIPT" --platform ios --bundle-root "$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"',
+      'fi',
+      "",
+    ].join("\n");
+  }
+  
+  // ─── iOS: Podfile Swift/C++ interop settings ─────────────────────────────────
+
   const TAG_IOS_PODFILE_NITROMODULES_CXX = "nitropush-ios-podfile-nitromodules-cxx";
   
   /**
-   * The Ruby snippet injected into the generated Podfile's post_install block.
-   *
-   * It rewrites `Pods/Target Support Files/NitroPush/NitroPush-umbrella.h`
-   * so the nitrogen-generated C++ `.hpp` `#imports` are wrapped in
-   * `#ifdef __cplusplus`. Without this, Xcode 26 validates the umbrella in
-   * pure ObjC mode and the `namespace margelo::nitro …` declarations fail
-   * with "unknown type name 'namespace'". Swift's C++ interop
-   * (`SWIFT_OBJC_INTEROP_MODE = objcxx`) still compiles the umbrella in ObjC++,
-   * so it picks up the guarded imports and resolves the `margelo::nitro::…`
-   * types referenced by the nitrogen-generated Swift typealiases.
-   *
-   * @internal Exported for unit testing.
-   */
-  /**
-   * Ruby snippet that forces C++ mode on the NitroModules target so Xcode 26
-   * can find `<functional>`, `<type_traits>`, etc. when validating its public
-   * module headers.  Without this, strict-modular-headers validation runs the
-   * umbrella in ObjC mode and the C++ stdlib `#include`s fail with
-   * "'functional' file not found".
+   * Ruby snippet that enables Swift/C++ interop and makes NitroModules' own
+   * private headers visible while Expo validates its modular public headers.
+   * Nothing under Pods is rewritten; Nitrogen remains the owner of generated
+   * header visibility.
    *
    * @internal Exported for unit testing.
    */
@@ -285,52 +400,21 @@ import {
     "      agg.user_project.targets.each do |target|",
     "        target.build_configurations.each do |config|",
     "          config.build_settings['SWIFT_OBJC_INTEROP_MODE'] = 'objcxx'",
+    "          header_paths = Array(config.build_settings['HEADER_SEARCH_PATHS'] || '$(inherited)')",
+    "          nitro_private_headers = '$(PODS_ROOT)/Headers/Private/NitroModules'",
+    "          header_paths << nitro_private_headers unless header_paths.include?(nitro_private_headers)",
+    "          config.build_settings['HEADER_SEARCH_PATHS'] = header_paths",
     "        end",
     "      end",
     "      agg.user_project.save",
     "    end",
-    "    # Step 3: Umbrella-header patch — wrap .hpp imports in #ifdef __cplusplus so",
-    "    #   ObjC-mode module validation skips C++ stdlib includes.",
-    "    nm_umbrella = File.join(",
-    "      installer.sandbox.root.to_s,",
-    "      'Target Support Files/NitroModules/NitroModules-umbrella.h'",
-    "    )",
-    "    if File.exist?(nm_umbrella)",
-    "      nm_content = File.read(nm_umbrella)",
-    "      nm_hpp = nm_content.scan(/^#import\\s+\"[^\"]+\\.hpp\"\\s*$/).join(\"\\n\")",
-    "      unless nm_hpp.empty? || nm_content.include?('#ifdef __cplusplus')",
-    "        nm_guarded = \"#ifdef __cplusplus\\n#{nm_hpp}\\n#endif\"",
-    "        nm_patched = nm_content.gsub(/^#import\\s+\"[^\"]+\\.hpp\"\\s*\\n/, '')",
-    "                               .sub(/(FOUNDATION_EXPORT double)/, \"#{nm_guarded}\\n\\n\\\\1\")",
-    "        File.write(nm_umbrella, nm_patched)",
-    "      end",
-    "    end",
-  ].join("\n");
-
-  export const NITROPUSH_PODFILE_UMBRELLA_SNIPPET = [
-    "    # NitroPush — Xcode 26 strict-modular-headers fix.",
-    "    nitropush_umbrella = File.join(",
-    "      installer.sandbox.root.to_s,",
-    "      'Target Support Files/NitroPush/NitroPush-umbrella.h'",
-    "    )",
-    "    if File.exist?(nitropush_umbrella)",
-    "      nitropush_content = File.read(nitropush_umbrella)",
-    "      nitropush_hpp = nitropush_content.scan(/^#import\\s+\"[^\"]+\\.hpp\"\\s*$/).join(\"\\n\")",
-    "      unless nitropush_hpp.empty? || nitropush_content.include?('#ifdef __cplusplus')",
-    "        nitropush_guarded = \"#ifdef __cplusplus\\n#{nitropush_hpp}\\n#endif\"",
-    "        nitropush_patched = nitropush_content.gsub(/^#import\\s+\"[^\"]+\\.hpp\"\\s*\\n/, '')",
-    "                                             .sub(/(FOUNDATION_EXPORT double)/, \"#{nitropush_guarded}\\n\\n\\\\1\")",
-    "        File.write(nitropush_umbrella, nitropush_patched)",
-    "      end",
-    "    end",
   ].join("\n");
   
   /**
-   * Injects {@link NITROPUSH_PODFILE_UMBRELLA_SNIPPET} into the Expo-generated
-   * Podfile's existing `post_install do |installer|` block, just after the
-   * `react_native_post_install(...)` call.
+   * Injects the Swift/C++ interop settings into the generated Podfile's
+   * existing `post_install do |installer|` block.
    *
-   * Idempotent via the `// @generated begin nitropush-ios-podfile-umbrella-patch`
+   * Idempotent via the generated mod markers
    * markers that `mergeContents` writes around the injected snippet.
    *
    * @internal Exported for unit testing.
@@ -340,21 +424,8 @@ import {
     // The next line is the call's closing `)`, so offset 2 lands AFTER the
     // call ends but still inside the surrounding `post_install do |installer|`
     // block — exactly where we want both patches to run.
-    const umbrellaExpo = mergeContents({
-      src: contents,
-      newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
-      anchor:
-        /:ccache_enabled\s*=>\s*ccache_enabled\?\(podfile_properties\),?\s*$/m,
-      offset: 2,
-      tag: TAG_IOS_PODFILE_UMBRELLA,
-      comment: "#",
-    });
-    const useExpoAnchors = umbrellaExpo.didMerge || umbrellaExpo.didClear;
-    let patched = umbrellaExpo.contents;
-
-    // NitroModules C++ fix — same anchor, injected right after the umbrella block.
     const cxxExpo = mergeContents({
-      src: patched,
+      src: contents,
       newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
       anchor:
         /:ccache_enabled\s*=>\s*ccache_enabled\?\(podfile_properties\),?\s*$/m,
@@ -362,22 +433,12 @@ import {
       tag: TAG_IOS_PODFILE_NITROMODULES_CXX,
       comment: "#",
     });
-    if (useExpoAnchors || cxxExpo.didMerge || cxxExpo.didClear) return cxxExpo.contents;
+    if (cxxExpo.didMerge || cxxExpo.didClear) return cxxExpo.contents;
 
     // Bare RN template (no Expo ccache helper): anchor on the last common
     // argument of react_native_post_install. Offset 2 lands past the `)`.
-    const umbrellaRn = mergeContents({
-      src: contents,
-      newSrc: NITROPUSH_PODFILE_UMBRELLA_SNIPPET,
-      anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
-      offset: 2,
-      tag: TAG_IOS_PODFILE_UMBRELLA,
-      comment: "#",
-    });
-    patched = umbrellaRn.contents;
-
     const cxxRn = mergeContents({
-      src: patched,
+      src: contents,
       newSrc: NITROMODULES_PODFILE_CXX_SNIPPET,
       anchor: /:mac_catalyst_enabled\s*=>\s*(?:true|false),?\s*$/m,
       offset: 2,
@@ -404,7 +465,10 @@ import {
    *      serverUrl + deploymentKey are provided).
    *   3. React Native's bundle loader checks the SDK's active bundle before
    *      falling back to the binary bundle (`bundleURL()` override).
-   *   4. `applicationDidBecomeActive` is overridden to call `notifyAppReady()`.
+   *
+   * The plugin deliberately does not call `notifyAppReady()`: only JS can
+   * prove the new bundle rendered successfully. It also removes the legacy
+   * generated lifecycle callback when upgrading an already-prebuilt app.
    *
    * @internal Exported for unit testing.
    */
@@ -419,6 +483,13 @@ import {
     } = {},
   ): string {
     let src = contents;
+
+    // Older plugin versions confirmed an OTA merely because UIKit became
+    // active, before React rendered. Remove that generated block during the
+    // next prebuild so rollback remains armed until JS explicitly confirms.
+    src = removeContents({ src, tag: TAG_IOS_NOTIFY_APP_READY }).contents;
+    // A later prebuild may disable native configuration or remove its key.
+    src = removeContents({ src, tag: TAG_IOS_CONFIGURE }).contents;
   
     // 1. import NitroPush — after the first import statement.
     src = mergeContents({
@@ -507,58 +578,9 @@ import {
       );
     }
   
-    // 4. notifyAppReady() in applicationDidBecomeActive.
-    //    Anchor: the `// Linking API` comment that follows didFinishLaunchingWithOptions
-    //    in the standard Expo AppDelegate template.
-    try {
-      src = mergeContents({
-        src,
-        newSrc: [
-          "",
-          "  public override func applicationDidBecomeActive(_ application: UIApplication) {",
-          "    super.applicationDidBecomeActive(application)",
-          "    NitroPushSdk.shared.notifyAppReady()",
-          "  }",
-          "",
-        ].join("\n"),
-        anchor: /\/\/ Linking API/m,
-        offset: 0,
-        tag: TAG_IOS_NOTIFY_APP_READY,
-        comment: "//",
-      }).contents;
-    } catch {
-      // Expo template may not have the `// Linking API` comment — fall back to
-      // anchoring on the `return super.application(...)` line inside
-      // didFinishLaunchingWithOptions and inserting two lines after it (past the
-      // closing `}`).
-      try {
-        src = mergeContents({
-          src,
-          newSrc: [
-            "",
-            "  public override func applicationDidBecomeActive(_ application: UIApplication) {",
-            "    super.applicationDidBecomeActive(application)",
-            "    NitroPushSdk.shared.notifyAppReady()",
-            "  }",
-            "",
-          ].join("\n"),
-          anchor:
-            /return super\.application\(\s*application\s*,\s*didFinishLaunchingWithOptions\s*:/m,
-          offset: 2,
-          tag: TAG_IOS_NOTIFY_APP_READY,
-          comment: "//",
-        }).contents;
-      } catch {
-        console.warn(
-          "[@nitropush/react-native] AppDelegate.swift: could not inject applicationDidBecomeActive. " +
-            "Add `NitroPushSdk.shared.notifyAppReady()` manually in that callback.",
-        );
-      }
-    }
-  
     return src;
   }
-  
+
   // ─── Android: MainApplication patching ───────────────────────────────────────
   
   const TAG_ANDROID_IMPORT = "nitropush-android-import";
@@ -600,22 +622,45 @@ import {
       );
     }
   
+    const legacyHostAnchor =
+      /object\s*:\s*DefaultReactNativeHost\s*\([^)]*\)\s*\{\s*$/m;
+    const expoReactHostAnchor =
+      /ExpoReactHostFactory\.getDefaultReactHost\s*\(\s*$/m;
+
     try {
-      src = mergeContents({
-        src,
-        newSrc:
-          "      override fun getJSBundleFile(): String? =\n" +
-          "        if (BuildConfig.DEBUG) super.getJSBundleFile()\n" +
-          "        else NitroPushSdk.shared.activeBundleFile() ?: super.getJSBundleFile()",
-        anchor: /object\s*:\s*DefaultReactNativeHost\s*\([^)]*\)\s*\{\s*$/m,
-        offset: 1,
-        tag: TAG_ANDROID_BUNDLE_FILE,
-        comment: "//",
-      }).contents;
+      if (legacyHostAnchor.test(src)) {
+        src = mergeContents({
+          src,
+          newSrc:
+            "      override fun getJSBundleFile(): String? =\n" +
+            "        if (BuildConfig.DEBUG) super.getJSBundleFile()\n" +
+            "        else NitroPushSdk.shared.activeBundleFile() ?: super.getJSBundleFile()",
+          anchor: legacyHostAnchor,
+          offset: 1,
+          tag: TAG_ANDROID_BUNDLE_FILE,
+          comment: "//",
+        }).contents;
+      } else if (expoReactHostAnchor.test(src)) {
+        // Expo SDK 57+ creates a ReactHost directly. Its factory exposes the
+        // production bundle path as a named argument, so inject NitroPush
+        // there while leaving debug builds on Metro.
+        src = mergeContents({
+          src,
+          newSrc:
+            "      jsBundleFilePath =\n" +
+            "        if (BuildConfig.DEBUG) null else NitroPushSdk.shared.activeBundleFile(),",
+          anchor: expoReactHostAnchor,
+          offset: 1,
+          tag: TAG_ANDROID_BUNDLE_FILE,
+          comment: "//",
+        }).contents;
+      } else {
+        throw new Error("unsupported React host template");
+      }
     } catch {
       console.warn(
-        "[@nitropush/react-native] MainApplication.kt has no DefaultReactNativeHost block; " +
-          "skipping getJSBundleFile injection.",
+        "[@nitropush/react-native] MainApplication.kt has no supported React host block; " +
+          "skipping active bundle injection.",
       );
     }
   
@@ -623,6 +668,5 @@ import {
   }
   
   // ─────────────────────────────────────────────────────────────────────────────
-  
+
   export default createRunOncePlugin(withNitroPush, PKG_NAME, PKG_VERSION);
-  
